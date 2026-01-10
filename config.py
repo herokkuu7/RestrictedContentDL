@@ -1,6 +1,3 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
-
 from os import getenv
 from time import time
 
@@ -25,11 +22,6 @@ class PyroConf(object):
     SESSION_STRING = getenv("SESSION_STRING")
     BOT_START_TIME = time()
 
-    # PROP: Number of files to process in parallel (User requested 3)
     MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
-    
-    # Batch chunk size (Keep this higher than Concurrent downloads, e.g., 10)
     BATCH_SIZE = int(getenv("BATCH_SIZE", "10"))
-    
-    # Delay between actions
     FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "3"))
