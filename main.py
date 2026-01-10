@@ -194,33 +194,94 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             LOGGER(__name__).info(f"Processing URL: {post_url}")
 
             # --- 1. TRY DIRECT CLONE (Optimization) ---
+            # Strategies:
+            # A. User -> Destination (Fastest, requires User to be Admin in Dest)
+            # B. Bot -> Destination (Fastest, requires Bot to be in Source)
+            # C. User -> Bot -> Destination (Relay, requires Source to be Cloneable)
+            
+            cloned = False
+            
+            # ATTEMPT A: User Client Direct
             try:
-                # Attempt to copy message directly. Fails if restricted or privacy blocks it.
                 if chat_message.media_group_id:
-                    await user.copy_media_group(
-                        chat_id=target_chat_id, 
-                        from_chat_id=chat_id, 
-                        message_id=message_id
-                    )
+                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 else:
-                    await user.copy_message(
-                        chat_id=target_chat_id, 
-                        from_chat_id=chat_id, 
-                        message_id=message_id
-                    )
-                
-                # If success, wait a bit and return (skip download)
-                LOGGER(__name__).info(f"Directly cloned message from {post_url} to {target_chat_id}")
-                # Using FLOOD_WAIT_DELAY as the standard delay between actions
+                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                cloned = True
+                LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
+            except Exception as e_user:
+                LOGGER(__name__).info(f"User direct clone failed: {e_user}")
+
+                # ATTEMPT B: Bot Client Direct
+                try:
+                    if chat_message.media_group_id:
+                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    else:
+                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    cloned = True
+                    LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
+                except Exception as e_bot:
+                    LOGGER(__name__).info(f"Bot direct clone failed: {e_bot}")
+
+                    # ATTEMPT C: Relay (User -> Bot -> Destination)
+                    # This works for Public Channels where Bot is NOT a member, but User IS.
+                    try:
+                        if not bot.me:
+                            await bot.get_me()
+                        
+                        bot_username = bot.me.username
+                        LOGGER(__name__).info(f"Attempting Relay Clone via {bot_username}...")
+
+                        if chat_message.media_group_id:
+                            # 1. User copies to Bot
+                            relayed_msgs = await user.copy_media_group(
+                                chat_id=bot_username,
+                                from_chat_id=chat_id,
+                                message_id=message_id
+                            )
+                            # 2. Bot copies to Destination (using the ID of the message it just received)
+                            if relayed_msgs:
+                                # Use the first message ID of the group as reference
+                                await bot.copy_media_group(
+                                    chat_id=target_chat_id,
+                                    from_chat_id=bot.me.id,
+                                    message_id=relayed_msgs[0].id
+                                )
+                                # Optional: Cleanup bot chat (complex for media groups, skipping delete for safety)
+                        else:
+                            # 1. User copies to Bot
+                            relayed_msg = await user.copy_message(
+                                chat_id=bot_username,
+                                from_chat_id=chat_id,
+                                message_id=message_id
+                            )
+                            # 2. Bot copies to Destination
+                            await bot.copy_message(
+                                chat_id=target_chat_id,
+                                from_chat_id=bot.me.id,
+                                message_id=relayed_msg.id
+                            )
+                            # 3. Cleanup
+                            try:
+                                await relayed_msg.delete()
+                            except:
+                                pass
+
+                        cloned = True
+                        LOGGER(__name__).info(f"Relay clone success: {post_url}")
+
+                    except Exception as e_relay:
+                        LOGGER(__name__).info(f"Relay clone failed: {e_relay}")
+
+            # If any clone attempt worked, exit early
+            if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
                 return 
-
-            except Exception as e:
-                # Clone failed (Restricted content? User not admin in target?), falling back to download
-                LOGGER(__name__).info(f"Direct clone failed for {post_url}, falling back to download. Reason: {e}")
             # ------------------------------------------
 
             # --- 2. FALLBACK: DOWNLOAD & UPLOAD ---
+            LOGGER(__name__).info("All clone methods failed. Falling back to Download & Upload.")
+            
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
                     chat_message.document.file_size
