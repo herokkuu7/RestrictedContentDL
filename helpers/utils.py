@@ -130,19 +130,24 @@ def progressArgs(action: str, progress_message, start_time):
 
 
 async def send_media(
-    bot, message, media_path, media_type, caption, progress_message, start_time
+    bot, message, media_path, media_type, caption, progress_message, start_time, destination_chat_id=None
 ):
     file_size = os.path.getsize(media_path)
+
+    # Use destination ID if provided, otherwise default to the chat command came from
+    target_chat_id = destination_chat_id if destination_chat_id else message.chat.id
 
     if not await fileSizeLimit(file_size, message, "upload"):
         return
 
     progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
-    LOGGER(__name__).info(f"Uploading media: {media_path} ({media_type})")
+    LOGGER(__name__).info(f"Uploading media: {media_path} ({media_type}) to {target_chat_id}")
 
+    # Note: We use bot.send_* methods instead of message.reply_* to support custom destinations
     if media_type == "photo":
-        await message.reply_photo(
-            media_path,
+        await bot.send_photo(
+            chat_id=target_chat_id,
+            photo=media_path,
             caption=caption or "",
             progress=Leaves.progress_for_pyrogram,
             progress_args=progress_args,
@@ -160,8 +165,9 @@ async def send_media(
 
         thumb = await get_video_thumbnail(media_path, duration)
 
-        await message.reply_video(
-            media_path,
+        await bot.send_video(
+            chat_id=target_chat_id,
+            video=media_path,
             duration=duration,
             width=width,
             height=height,
@@ -173,8 +179,9 @@ async def send_media(
         )
     elif media_type == "audio":
         duration, artist, title, _, _ = await get_media_info(media_path)
-        await message.reply_audio(
-            media_path,
+        await bot.send_audio(
+            chat_id=target_chat_id,
+            audio=media_path,
             duration=duration,
             performer=artist,
             title=title,
@@ -183,8 +190,9 @@ async def send_media(
             progress_args=progress_args,
         )
     elif media_type == "document":
-        await message.reply_document(
-            media_path,
+        await bot.send_document(
+            chat_id=target_chat_id,
+            document=media_path,
             caption=caption or "",
             progress=Leaves.progress_for_pyrogram,
             progress_args=progress_args,
@@ -220,11 +228,14 @@ async def download_single_media(msg, progress_message, start_time):
     return ("skip", None, None)
 
 
-async def processMediaGroup(chat_message, bot, message):
+async def processMediaGroup(chat_message, bot, message, destination_chat_id=None):
     media_group_messages = await chat_message.get_media_group()
     valid_media = []
     temp_paths = []
     invalid_paths = []
+    
+    # Target chat determination
+    target_chat_id = destination_chat_id if destination_chat_id else message.chat.id
 
     start_time = time()
     progress_message = await message.reply("📥 Downloading media group...")
@@ -255,7 +266,7 @@ async def processMediaGroup(chat_message, bot, message):
 
     if valid_media:
         try:
-            await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
+            await bot.send_media_group(chat_id=target_chat_id, media=valid_media)
             await progress_message.delete()
         except Exception:
             await message.reply(
@@ -263,33 +274,34 @@ async def processMediaGroup(chat_message, bot, message):
             )
             for media in valid_media:
                 try:
+                    # Fallback individual sends must also respect target_chat_id
                     if isinstance(media, InputMediaPhoto):
                         await bot.send_photo(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             photo=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaVideo):
                         await bot.send_video(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             video=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaDocument):
                         await bot.send_document(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             document=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaAudio):
                         await bot.send_audio(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             audio=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, Voice):
                         await bot.send_voice(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             voice=media.media,
                             caption=media.caption,
                         )
