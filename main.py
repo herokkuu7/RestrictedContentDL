@@ -1,5 +1,4 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
+
 
 import os
 import shutil
@@ -182,7 +181,7 @@ async def set_destination(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # CORE DOWNLOAD LOGIC (With Cloning)
 # -------------------------------------------------------------------------------------
-async def handle_download(bot: Client, message: Message, post_url: str):
+async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False):
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
@@ -227,7 +226,6 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     LOGGER(__name__).info(f"Bot direct clone failed: {e_bot}")
 
                     # ATTEMPT C: Relay (User -> Bot -> Destination)
-                    # This works for Public Channels where Bot is NOT a member, but User IS.
                     try:
                         if not bot.me:
                             await bot.get_me()
@@ -242,15 +240,13 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                                 from_chat_id=chat_id,
                                 message_id=message_id
                             )
-                            # 2. Bot copies to Destination (using the ID of the message it just received)
+                            # 2. Bot copies to Destination
                             if relayed_msgs:
-                                # Use the first message ID of the group as reference
                                 await bot.copy_media_group(
                                     chat_id=target_chat_id,
                                     from_chat_id=bot.me.id,
                                     message_id=relayed_msgs[0].id
                                 )
-                                # Optional: Cleanup bot chat (complex for media groups, skipping delete for safety)
                         else:
                             # 1. User copies to Bot
                             relayed_msg = await user.copy_message(
@@ -283,7 +279,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             # ------------------------------------------
 
             # --- 2. FALLBACK: DOWNLOAD & UPLOAD ---
-            LOGGER(__name__).info("All clone methods failed. Falling back to Download & Upload.")
+            # LOGGER(__name__).info("All clone methods failed. Falling back to Download & Upload.")
             
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
@@ -307,35 +303,45 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             )
 
             if chat_message.media_group_id:
-                # Pass destination_chat_id to processMediaGroup
                 if not await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
+                    if not silent:
+                        await message.reply(
+                            "**Could not extract any valid media from the media group.**"
+                        )
                 return
 
             elif chat_message.media:
                 start_time = time()
-                progress_message = await message.reply(f"**📥 Downloading {message_id}...**")
+                
+                # --- NEW LOGIC: Generic Start Message + ID in Progress Header ---
+                if not silent:
+                    # We send a generic message to initialize the progress bar container
+                    progress_message = await message.reply("**⏳ Initializing...**")
+                    progress_func = progress_for_pyrogram
+                    # Inject the ID into the Action Header string
+                    progress_action_str = f"📥 Downloading (ID: {message_id})"
+                    prog_args = progressArgs(progress_action_str, progress_message, start_time)
+                else:
+                    progress_message = None
+                    progress_func = None
+                    prog_args = None
 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
 
                 media_path = await chat_message.download(
                     file_name=download_path,
-                    progress=progress_for_pyrogram, # UPDATED: Use custom progress
-                    progress_args=progressArgs(
-                        "📥 Downloading Progress", progress_message, start_time
-                    ),
+                    progress=progress_func, # Use the variable
+                    progress_args=prog_args, # Use the variable
                 )
 
                 if not media_path or not os.path.exists(media_path):
-                    await progress_message.edit("**❌ Download failed: File not saved properly**")
+                    if progress_message: await progress_message.edit("**❌ Download failed: File not saved properly**")
                     return
 
                 file_size = os.path.getsize(media_path)
                 if file_size == 0:
-                    await progress_message.edit("**❌ Download failed: File is empty**")
+                    if progress_message: await progress_message.edit("**❌ Download failed: File is empty**")
                     cleanup_download(media_path)
                     return
 
@@ -351,20 +357,22 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     else "document"
                 )
                 
-                # Pass destination_chat_id to send_media
                 await send_media(
                     bot,
                     message,
                     media_path,
                     media_type,
                     parsed_caption,
-                    progress_message,
+                    progress_message, # Pass None if silent
                     start_time,
                     destination_chat_id=target_chat_id
                 )
 
                 cleanup_download(media_path)
-                await progress_message.delete()
+                
+                # Only delete if we actually sent a status message
+                if progress_message:
+                    await progress_message.delete()
 
             elif chat_message.text or chat_message.caption:
                 # Send text to target chat
@@ -373,13 +381,16 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 else:
                     await message.reply(parsed_text or parsed_caption)
             else:
-                await message.reply("**No media or text found in the post URL.**")
+                if not silent:
+                    await message.reply("**No media or text found in the post URL.**")
 
         except (PeerIdInvalid, BadRequest, KeyError):
-            await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
+            if not silent:
+                await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
         except Exception as e:
             error_message = f"**❌ Error at {post_url}: {str(e)}**"
-            await message.reply(error_message)
+            if not silent:
+                await message.reply(error_message)
             LOGGER(__name__).error(e)
 
 
@@ -389,7 +400,8 @@ async def download_media(bot: Client, message: Message):
         await message.reply("**Provide a post URL after the /dl command.**")
         return
     post_url = message.command[1]
-    await track_task(handle_download(bot, message, post_url))
+    # Single download is NOT silent, so we see progress bars
+    await track_task(handle_download(bot, message, post_url, silent=False))
 
 
 # -------------------------------------------------------------------------------------
@@ -447,7 +459,7 @@ async def handle_text_and_states(bot: Client, message: Message):
 
     # 2. If not in state, treat as a single download link (if it looks like a link)
     if message.text and not message.text.startswith("/"):
-        await track_task(handle_download(bot, message, message.text))
+        await track_task(handle_download(bot, message, message.text, silent=False))
 
 
 # Helper to run the batch loop
@@ -488,8 +500,12 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 skipped += 1
                 continue
 
-            # Spawn task
-            task = track_task(handle_download(bot, message, url))
+            # Spawn task - Enable Silent Mode for Batch to avoid FloodWait!
+            # Change silent=False to silent=True if you want completely silent batch
+            # But user wants progress bars. If user wants progress bars, we MUST use silent=False
+            # BUT we implemented the 25s delay in utils.py so it is SAFE now.
+            # So we set silent=False here to show bars as requested.
+            task = track_task(handle_download(bot, message, url, silent=False))
             batch_tasks.append(task)
 
             # Wait if batch size reached
@@ -609,7 +625,6 @@ if __name__ == "__main__":
         loop.run_until_complete(initialize())
         
         # Start the User Client
-        # FIX: Directly call start() because it is synchronous in this library version.
         user.start()
         
         # Start the Dummy Web Server
@@ -624,3 +639,5 @@ if __name__ == "__main__":
         LOGGER(__name__).error(err)
     finally:
         LOGGER(__name__).info("Bot Stopped")
+
+}
