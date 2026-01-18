@@ -639,5 +639,3 @@ if __name__ == "__main__":
         LOGGER(__name__).error(err)
     finally:
         LOGGER(__name__).info("Bot Stopped")
-
-}
