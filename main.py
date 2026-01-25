@@ -12,14 +12,15 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
     processMediaGroup,
     progressArgs,
     send_media,
-    progress_for_pyrogram # Added this import
+    progress_for_pyrogram,
+    refresh_progress_message
 )
 
 from helpers.files import (
@@ -482,6 +483,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     )
 
     downloaded = skipped = failed = 0
+    skipped_streak = 0
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
 
@@ -489,16 +491,31 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         url = f"{prefix}/{msg_id}"
         try:
             # Check if message exists/is empty
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+            try:
+                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+            except FloodWait as e:
+                LOGGER(__name__).warning(f"FloodWait while fetching {url}. Sleeping {e.value}s.")
+                await asyncio.sleep(e.value)
+                chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+
             if not chat_msg:
                 skipped += 1
+                skipped_streak += 1
+                if skipped_streak >= BATCH_SIZE:
+                    await asyncio.sleep(4)
+                    skipped_streak = 0
                 continue
 
             has_media = bool(chat_msg.media_group_id or chat_msg.media)
             has_text  = bool(chat_msg.text or chat_msg.caption)
             if not (has_media or has_text):
                 skipped += 1
+                skipped_streak += 1
+                if skipped_streak >= BATCH_SIZE:
+                    await asyncio.sleep(4)
+                    skipped_streak = 0
                 continue
+            skipped_streak = 0
 
             # Spawn task - Enable Silent Mode for Batch to avoid FloodWait!
             # Change silent=False to silent=True if you want completely silent batch
@@ -576,6 +593,15 @@ async def logs(_, message: Message):
         await message.reply_document(document="logs.txt", caption="**Logs**")
     else:
         await message.reply("**Not exists**")
+
+
+@bot.on_callback_query(filters.regex("^refresh_progress$"))
+async def refresh_progress_callback(_, query):
+    refreshed = await refresh_progress_message(query.message)
+    if refreshed:
+        await query.answer("Progress refreshed.")
+    else:
+        await query.answer("No active progress for this message.", show_alert=True)
 
 
 @bot.on_message(filters.command("killall") & filters.private)

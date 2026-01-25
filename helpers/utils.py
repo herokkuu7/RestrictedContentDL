@@ -9,6 +9,8 @@ from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
 from pyrogram.parser import Parser
 from pyrogram.utils import get_channel_id
 from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
     InputMediaDocument,
@@ -32,11 +34,65 @@ from logger import LOGGER
 PROGRESS_BAR = """
 Percentage: {percentage:.2f}% | {current}/{total}
 Speed: {speed}/s
+Elapsed Time: {elapsed_time}
 Estimated Time Left: {est_time}
 """
 
 # Cache to limit progress updates
 PROGRESS_CACHE = {}
+PROGRESS_STATE = {}
+PROGRESS_RESET_START = {}
+
+
+def progress_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔄 Refresh", callback_data="refresh_progress")]]
+    )
+
+
+def build_progress_text(
+    current,
+    total,
+    action,
+    start_time,
+    template,
+    finish,
+    unfinish
+):
+    percentage = (current * 100) / total
+
+    elapsed_time = time.time() - start_time
+    if elapsed_time <= 0:
+        elapsed_time = 0.1
+
+    speed = current / elapsed_time
+    speed_text = f"{get_readable_file_size(speed)}/s"
+
+    remaining_bytes = total - current
+    if speed > 0:
+        etl_seconds = remaining_bytes / speed
+        etl_text = get_readable_time(int(etl_seconds))
+    else:
+        etl_text = "0s"
+
+    bar_len = 20
+    filled = int(percentage / 100 * bar_len)
+    bar = finish * filled + unfinish * (bar_len - filled)
+
+    current_size = get_readable_file_size(current)
+    total_size = get_readable_file_size(total)
+    elapsed_text = get_readable_time(int(elapsed_time))
+
+    text = template.format(
+        percentage=percentage,
+        current=current_size,
+        total=total_size,
+        speed=speed_text,
+        elapsed_time=elapsed_text,
+        est_time=etl_text
+    )
+
+    return f"**{action}**\n{bar}\n{text}"
 
 
 async def cmd_exec(cmd, shell=False):
@@ -153,11 +209,24 @@ async def progress_for_pyrogram(
 
     is_download = "Download" in action
     size_mb = total / (1024 * 1024)
+    reset_start = PROGRESS_RESET_START.get(message.id)
+    if reset_start:
+        start_time = reset_start
 
     if is_download:
-        interval = 25 if size_mb < 500 else 35
+        interval = 25 if size_mb < 500 else 20
     else:
-        interval = 15 if size_mb < 500 else 25
+        interval = 5 if size_mb < 500 else 10
+
+    PROGRESS_STATE[message.id] = {
+        "current": current,
+        "total": total,
+        "action": action,
+        "start_time": start_time,
+        "template": template,
+        "finish": finish,
+        "unfinish": unfinish,
+    }
 
     last_update = PROGRESS_CACHE.get(message.id, 0)
     if current != total and (now - last_update) < interval:
@@ -165,39 +234,18 @@ async def progress_for_pyrogram(
 
     PROGRESS_CACHE[message.id] = now
 
-    percentage = (current * 100) / total
-
-    elapsed_time = now - start_time
-    if elapsed_time <= 0:
-        elapsed_time = 0.1
-
-    speed = current / elapsed_time
-    speed_text = f"{get_readable_file_size(speed)}/s"
-
-    remaining_bytes = total - current
-    if speed > 0:
-        etl_seconds = remaining_bytes / speed
-        etl_text = get_readable_time(int(etl_seconds))
-    else:
-        etl_text = "0s"
-
-    bar_len = 20
-    filled = int(percentage / 100 * bar_len)
-    bar = finish * filled + unfinish * (bar_len - filled)
-
-    current_size = get_readable_file_size(current)
-    total_size = get_readable_file_size(total)
-
-    text = template.format(
-        percentage=percentage,
-        current=current_size,
-        total=total_size,
-        speed=speed_text,
-        est_time=etl_text
+    text = build_progress_text(
+        current=current,
+        total=total,
+        action=action,
+        start_time=start_time,
+        template=template,
+        finish=finish,
+        unfinish=unfinish
     )
 
     try:
-        await message.edit(f"**{action}**\n{bar}\n{text}")
+        await message.edit(text, reply_markup=progress_keyboard())
     except MessageNotModified:
         pass
     except Exception as e:
@@ -205,6 +253,37 @@ async def progress_for_pyrogram(
 
     if current == total:
         PROGRESS_CACHE.pop(message.id, None)
+        PROGRESS_STATE.pop(message.id, None)
+        PROGRESS_RESET_START.pop(message.id, None)
+
+
+async def refresh_progress_message(message):
+    state = PROGRESS_STATE.get(message.id)
+    if not state:
+        return False
+
+    state["start_time"] = time.time()
+    PROGRESS_RESET_START[message.id] = state["start_time"]
+    PROGRESS_CACHE[message.id] = 0
+
+    text = build_progress_text(
+        current=state["current"],
+        total=state["total"],
+        action=state["action"],
+        start_time=state["start_time"],
+        template=state["template"],
+        finish=state["finish"],
+        unfinish=state["unfinish"]
+    )
+    try:
+        await message.edit(text, reply_markup=progress_keyboard())
+    except MessageNotModified:
+        return True
+    except Exception as e:
+        LOGGER(__name__).error(f"Progress Refresh Error: {e}")
+        return False
+
+    return True
 
 
 async def send_media(
