@@ -196,6 +196,33 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
 
+            # --- 0. DIRECT FORWARD FOR PRIVATE CHATS (If Forwarding Allowed) ---
+            is_private_chat = getattr(chat_message.chat, "type", None) == "private"
+            has_protected_content = getattr(chat_message.chat, "has_protected_content", False)
+            if is_private_chat and not has_protected_content:
+                try:
+                    if chat_message.media_group_id:
+                        media_group = await user.get_media_group(chat_id=chat_id, message_id=message_id)
+                        media_ids = [msg.id for msg in media_group]
+                        await user.forward_messages(target_chat_id, chat_id, media_ids)
+                    else:
+                        await user.forward_messages(target_chat_id, chat_id, message_id)
+                    LOGGER(__name__).info(f"Forwarded from private chat via User: {post_url}")
+                    return
+                except Exception as e_user_forward:
+                    LOGGER(__name__).info(f"User forward failed: {e_user_forward}")
+                    try:
+                        if chat_message.media_group_id:
+                            media_group = await bot.get_media_group(chat_id=chat_id, message_id=message_id)
+                            media_ids = [msg.id for msg in media_group]
+                            await bot.forward_messages(target_chat_id, chat_id, media_ids)
+                        else:
+                            await bot.forward_messages(target_chat_id, chat_id, message_id)
+                        LOGGER(__name__).info(f"Forwarded from private chat via Bot: {post_url}")
+                        return
+                    except Exception as e_bot_forward:
+                        LOGGER(__name__).info(f"Bot forward failed: {e_bot_forward}")
+
             # --- 1. TRY DIRECT CLONE (Optimization) ---
             # Strategies:
             # A. User -> Destination (Fastest, requires User to be Admin in Dest)
