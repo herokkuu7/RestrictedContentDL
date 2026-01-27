@@ -71,6 +71,33 @@ BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...
 DESTINATION_CHAT_ID = None
 DESTINATION_SETS = {}
 
+def should_ping_destination(message: Message) -> bool:
+    if message.reply_to_message:
+        return True
+    if not message.entities:
+        return False
+    return any(entity.type in ("mention", "text_mention") for entity in message.entities)
+
+
+async def send_ping_notice(message: Message, target_chat_id: int, forward_messages):
+    if not should_ping_destination(message):
+        return
+    if not forward_messages:
+        return
+    if isinstance(forward_messages, list):
+        target_message = forward_messages[0]
+    else:
+        target_message = forward_messages
+    try:
+        ping_text = f"🔔 Ping from {message.from_user.mention}"
+        await bot.send_message(
+            target_chat_id,
+            ping_text,
+            reply_to_message_id=target_message.id
+        )
+    except Exception as e:
+        LOGGER(__name__).info(f"Ping notice failed: {e}")
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -247,23 +274,27 @@ async def handle_download(
             has_protected_content = getattr(chat_message.chat, "has_protected_content", False)
             if is_private_chat and not has_protected_content:
                 try:
+                    forwarded = None
                     if chat_message.media_group_id:
                         media_group = await user.get_media_group(chat_id=chat_id, message_id=message_id)
                         media_ids = [msg.id for msg in media_group]
-                        await user.forward_messages(target_chat_id, chat_id, media_ids)
+                        forwarded = await user.forward_messages(target_chat_id, chat_id, media_ids)
                     else:
-                        await user.forward_messages(target_chat_id, chat_id, message_id)
+                        forwarded = await user.forward_messages(target_chat_id, chat_id, message_id)
+                    await send_ping_notice(message, target_chat_id, forwarded)
                     LOGGER(__name__).info(f"Forwarded from private chat via User: {post_url}")
                     return
                 except Exception as e_user_forward:
                     LOGGER(__name__).info(f"User forward failed: {e_user_forward}")
                     try:
+                        forwarded = None
                         if chat_message.media_group_id:
                             media_group = await bot.get_media_group(chat_id=chat_id, message_id=message_id)
                             media_ids = [msg.id for msg in media_group]
-                            await bot.forward_messages(target_chat_id, chat_id, media_ids)
+                            forwarded = await bot.forward_messages(target_chat_id, chat_id, media_ids)
                         else:
-                            await bot.forward_messages(target_chat_id, chat_id, message_id)
+                            forwarded = await bot.forward_messages(target_chat_id, chat_id, message_id)
+                        await send_ping_notice(message, target_chat_id, forwarded)
                         LOGGER(__name__).info(f"Forwarded from private chat via Bot: {post_url}")
                         return
                     except Exception as e_bot_forward:
@@ -279,10 +310,20 @@ async def handle_download(
             
             # ATTEMPT A: User Client Direct
             try:
+                forwarded = None
                 if chat_message.media_group_id:
-                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    forwarded = await user.copy_media_group(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message_id
+                    )
                 else:
-                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    forwarded = await user.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message_id
+                    )
+                await send_ping_notice(message, target_chat_id, forwarded)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except Exception as e_user:
@@ -290,10 +331,20 @@ async def handle_download(
 
                 # ATTEMPT B: Bot Client Direct
                 try:
+                    forwarded = None
                     if chat_message.media_group_id:
-                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        forwarded = await bot.copy_media_group(
+                            chat_id=target_chat_id,
+                            from_chat_id=chat_id,
+                            message_id=message_id
+                        )
                     else:
-                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        forwarded = await bot.copy_message(
+                            chat_id=target_chat_id,
+                            from_chat_id=chat_id,
+                            message_id=message_id
+                        )
+                    await send_ping_notice(message, target_chat_id, forwarded)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
                 except Exception as e_bot:
@@ -307,6 +358,7 @@ async def handle_download(
                         bot_username = bot.me.username
                         LOGGER(__name__).info(f"Attempting Relay Clone via {bot_username}...")
 
+                        forwarded = None
                         if chat_message.media_group_id:
                             # 1. User copies to Bot
                             relayed_msgs = await user.copy_media_group(
@@ -316,7 +368,7 @@ async def handle_download(
                             )
                             # 2. Bot copies to Destination
                             if relayed_msgs:
-                                await bot.copy_media_group(
+                                forwarded = await bot.copy_media_group(
                                     chat_id=target_chat_id,
                                     from_chat_id=bot.me.id,
                                     message_id=relayed_msgs[0].id
@@ -329,7 +381,7 @@ async def handle_download(
                                 message_id=message_id
                             )
                             # 2. Bot copies to Destination
-                            await bot.copy_message(
+                            forwarded = await bot.copy_message(
                                 chat_id=target_chat_id,
                                 from_chat_id=bot.me.id,
                                 message_id=relayed_msg.id
@@ -340,6 +392,7 @@ async def handle_download(
                             except:
                                 pass
 
+                        await send_ping_notice(message, target_chat_id, forwarded)
                         cloned = True
                         LOGGER(__name__).info(f"Relay clone success: {post_url}")
 
