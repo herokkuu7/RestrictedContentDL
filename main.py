@@ -1,6 +1,7 @@
 
 
 import os
+import re
 import shutil
 import psutil
 import asyncio
@@ -142,11 +143,16 @@ async def help_command(_, message: Message):
 async def set_destination(bot: Client, message: Message):
     global DESTINATION_CHAT_ID
 
-    command_name = message.command[0]
-    set_suffix = command_name[3:] if command_name.startswith("set") else ""
-    set_key = set_suffix or None
+    if not message.text:
+        return
 
-    if len(message.command) < 2:
+    match = re.match(r"^/set(\d+)?(?:\s+|$)(.*)", message.text.strip())
+    if not match:
+        return
+    set_key = match.group(1) or None
+    input_arg = match.group(2).strip()
+
+    if not input_arg:
         base_usage = "❌ **Usage:** `/set <channel_id>`\nExample: `/set -100123456789`\nTo reset: `/set none`"
         if set_key:
             base_usage = (
@@ -156,8 +162,6 @@ async def set_destination(bot: Client, message: Message):
             )
         await message.reply(base_usage)
         return
-
-    input_arg = message.command[1]
 
     if input_arg.lower() == "none":
         if set_key:
@@ -479,9 +483,13 @@ async def download_media(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 @bot.on_message(filters.regex(r"^/batch(\d+)?(?:\s|$)") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
-    command_name = message.command[0]
-    batch_suffix = command_name[5:] if command_name.startswith("batch") else ""
-    set_key = batch_suffix or None
+    if not message.text:
+        return
+
+    match = re.match(r"^/batch(\d+)?(?:\s|$)", message.text.strip())
+    if not match:
+        return
+    set_key = match.group(1) or None
 
     if set_key and set_key not in DESTINATION_SETS:
         await message.reply(
