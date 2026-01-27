@@ -33,7 +33,7 @@ from logger import LOGGER
 # Progress bar template
 PROGRESS_BAR = """
 Percentage: {percentage:.2f}% | {current}/{total}
-Speed: {speed}/s
+Speed: {speed}
 Elapsed Time: {elapsed_time}
 Estimated Time Left: {est_time}
 """
@@ -79,6 +79,13 @@ def build_progress_text(
     )
 
     return f"**{action}**\n{bar}\n{text}"
+
+
+def get_readable_speed_mb(speed_in_bytes: float) -> str:
+    if speed_in_bytes <= 0:
+        return "0.00 MB/s"
+    speed_mb = speed_in_bytes / (1024 * 1024)
+    return f"{speed_mb:.2f} MB/s"
 
 
 async def cmd_exec(cmd, shell=False):
@@ -240,7 +247,7 @@ async def progress_for_pyrogram(
         delta_bytes = 0
 
     speed_value = delta_bytes / delta_time if delta_bytes else (current / elapsed_time)
-    speed_text = f"{get_readable_file_size(speed_value)}/s"
+    speed_text = get_readable_speed_mb(speed_value)
 
     remaining_bytes = total - current
     if speed_value > 0:
@@ -291,8 +298,6 @@ async def refresh_progress_message(message):
 
     PROGRESS_REFRESH_COOLDOWN[message.id] = now
     PROGRESS_CACHE[message.id] = 0
-    state["last_time"] = now
-    state["last_current"] = state["current"]
 
     elapsed_time = now - state["start_time"]
     if elapsed_time <= 0:
@@ -306,7 +311,7 @@ async def refresh_progress_message(message):
         delta_bytes = 0
 
     speed_value = delta_bytes / delta_time if delta_bytes else (state["current"] / elapsed_time)
-    speed_text = f"{get_readable_file_size(speed_value)}/s"
+    speed_text = get_readable_speed_mb(speed_value)
 
     remaining_bytes = state["total"] - state["current"]
     if speed_value > 0:
@@ -334,6 +339,9 @@ async def refresh_progress_message(message):
     except Exception as e:
         LOGGER(__name__).error(f"Progress Refresh Error: {e}")
         return False, 0
+
+    state["last_time"] = now
+    state["last_current"] = state["current"]
 
     return True, 0
 
