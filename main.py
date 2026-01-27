@@ -603,8 +603,10 @@ async def handle_text_and_states(bot: Client, message: Message):
             # Clean up state
             del BATCH_STATES[user_id]
             
-            # Execute Batch
-            await execute_batch_logic(bot, message, start_link, count, set_key=set_key)
+            # Execute Batch in background so multiple batches can run in parallel
+            track_task(
+                execute_batch_logic(bot, message, start_link, count, set_key=set_key)
+            )
             return
 
     # 2. If not in state, treat as a single download link (if it looks like a link)
