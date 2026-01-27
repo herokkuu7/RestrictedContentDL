@@ -1,11 +1,13 @@
 
 
 import os
+import re
 import shutil
 import psutil
 import asyncio
 from time import time
 from aiohttp import web
+from typing import Optional
 
 # Removed pyleaves import
 # from pyleaves import Leaves
@@ -67,6 +69,34 @@ BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...
 
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
+DESTINATION_SETS = {}
+
+def should_ping_destination(message: Message) -> bool:
+    if message.reply_to_message:
+        return True
+    if not message.entities:
+        return False
+    return any(entity.type in ("mention", "text_mention") for entity in message.entities)
+
+
+async def send_ping_notice(message: Message, target_chat_id: int, forward_messages):
+    if not should_ping_destination(message):
+        return
+    if not forward_messages:
+        return
+    if isinstance(forward_messages, list):
+        target_message = forward_messages[0]
+    else:
+        target_message = forward_messages
+    try:
+        ping_text = f"🔔 Ping from {message.from_user.mention}"
+        await bot.send_message(
+            target_chat_id,
+            ping_text,
+            reply_to_message_id=target_message.id
+        )
+    except Exception as e:
+        LOGGER(__name__).info(f"Ping notice failed: {e}")
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -86,7 +116,8 @@ async def start(_, message: Message):
         "or reply to a message with `/dl`.\n\n"
         "**New Feature:**\n"
         "Use `/batch` to clone/download multiple messages easily!\n"
-        "Use `/set <channel_id>` to set a custom upload destination.\n\n"
+        "Use `/set <channel_id>` to set a custom upload destination.\n"
+        "Use `/set1 <channel_id>` + `/batch1` for multiple destinations.\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
         "🔒 Make sure the user client is part of the chat.\n\n"
         "Ready? Send me a Telegram post link!"
@@ -109,9 +140,15 @@ async def help_command(_, message: Message):
         "   2. Send the **Start Link**\n"
         "   3. Send the **Number of Messages** (e.g., 100)\n"
         "   The bot will calculate the range and process them.\n\n"
+        "➤ **Batch Process (Multiple Destinations)**\n"
+        "   1. Send `/set1 <channel_id>` (repeat for `/set2`, `/set3`, ...)\n"
+        "   2. Send `/batch1` (or `/batch2`, ...)\n"
+        "   3. Follow the same steps as `/batch`\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
+        "   – `/set1 -100xxxx`: Set destination for batch1.\n"
         "   – `/set none`: Reset to default (upload to this chat).\n"
+        "   – `/set1 none`: Reset destination for batch1.\n"
         "     *Note: Bot must be admin in the target channel.*\n\n"
         "➤ **Requirements**\n"
         "   – Make sure the user client is part of the chat.\n\n"
@@ -129,23 +166,39 @@ async def help_command(_, message: Message):
 # -------------------------------------------------------------------------------------
 # DESTINATION CHANNEL SETTING
 # -------------------------------------------------------------------------------------
-@bot.on_message(filters.command("set") & filters.private)
+@bot.on_message(filters.regex(r"^/set(\d+)?(?:\s|$)") & filters.private)
 async def set_destination(bot: Client, message: Message):
     global DESTINATION_CHAT_ID
-    
-    if len(message.command) < 2:
-        await message.reply(
-            "❌ **Usage:** `/set <channel_id>`\n"
-            "Example: `/set -100123456789`\n"
-            "To reset: `/set none`"
-        )
+
+    if not message.text:
         return
 
-    input_arg = message.command[1]
+    match = re.match(r"^/set(\d+)?(?:\s+|$)(.*)", message.text.strip())
+    if not match:
+        return
+    set_key = match.group(1) or None
+    input_arg = match.group(2).strip()
+
+    if not input_arg:
+        base_usage = "❌ **Usage:** `/set <channel_id>`\nExample: `/set -100123456789`\nTo reset: `/set none`"
+        if set_key:
+            base_usage = (
+                f"❌ **Usage:** `/set{set_key} <channel_id>`\n"
+                f"Example: `/set{set_key} -100123456789`\n"
+                f"To reset: `/set{set_key} none`"
+            )
+        await message.reply(base_usage)
+        return
 
     if input_arg.lower() == "none":
-        DESTINATION_CHAT_ID = None
-        await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
+        if set_key:
+            DESTINATION_SETS.pop(set_key, None)
+            await message.reply(
+                f"✅ **Destination removed for set {set_key}.**"
+            )
+        else:
+            DESTINATION_CHAT_ID = None
+            await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
         return
 
     try:
@@ -171,9 +224,23 @@ async def set_destination(bot: Client, message: Message):
             )
             return
 
-        DESTINATION_CHAT_ID = target_id
-        await message.reply(f"✅ **Destination Channel Set!**\nAll downloads will now be uploaded to ID: `{target_id}`")
-        LOGGER(__name__).info(f"Destination channel set to {target_id} by user {message.from_user.id}")
+        if set_key:
+            DESTINATION_SETS[set_key] = target_id
+            await message.reply(
+                f"✅ **Destination Set for set {set_key}!**\n"
+                f"Uploads for `/batch{set_key}` will go to ID: `{target_id}`"
+            )
+            LOGGER(__name__).info(
+                f"Destination set {set_key} set to {target_id} by user {message.from_user.id}"
+            )
+        else:
+            DESTINATION_CHAT_ID = target_id
+            await message.reply(
+                f"✅ **Destination Channel Set!**\nAll downloads will now be uploaded to ID: `{target_id}`"
+            )
+            LOGGER(__name__).info(
+                f"Destination channel set to {target_id} by user {message.from_user.id}"
+            )
 
     except Exception as e:
         await message.reply(f"❌ **Error:** {str(e)}")
@@ -182,19 +249,57 @@ async def set_destination(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # CORE DOWNLOAD LOGIC (With Cloning)
 # -------------------------------------------------------------------------------------
-async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False):
+async def handle_download(
+    bot: Client,
+    message: Message,
+    post_url: str,
+    silent: bool = False,
+    destination_chat_id: Optional[int] = None,
+    batch_label: Optional[str] = None
+):
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
         # Determine target chat
-        target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
+        target_chat_id = destination_chat_id or DESTINATION_CHAT_ID or message.chat.id
 
         try:
             chat_id, message_id = getChatMsgID(post_url)
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
+
+            # --- 0. DIRECT FORWARD FOR PRIVATE CHATS (If Forwarding Allowed) ---
+            is_private_chat = getattr(chat_message.chat, "type", None) == "private"
+            has_protected_content = getattr(chat_message.chat, "has_protected_content", False)
+            if is_private_chat and not has_protected_content:
+                try:
+                    forwarded = None
+                    if chat_message.media_group_id:
+                        media_group = await user.get_media_group(chat_id=chat_id, message_id=message_id)
+                        media_ids = [msg.id for msg in media_group]
+                        forwarded = await user.forward_messages(target_chat_id, chat_id, media_ids)
+                    else:
+                        forwarded = await user.forward_messages(target_chat_id, chat_id, message_id)
+                    await send_ping_notice(message, target_chat_id, forwarded)
+                    LOGGER(__name__).info(f"Forwarded from private chat via User: {post_url}")
+                    return
+                except Exception as e_user_forward:
+                    LOGGER(__name__).info(f"User forward failed: {e_user_forward}")
+                    try:
+                        forwarded = None
+                        if chat_message.media_group_id:
+                            media_group = await bot.get_media_group(chat_id=chat_id, message_id=message_id)
+                            media_ids = [msg.id for msg in media_group]
+                            forwarded = await bot.forward_messages(target_chat_id, chat_id, media_ids)
+                        else:
+                            forwarded = await bot.forward_messages(target_chat_id, chat_id, message_id)
+                        await send_ping_notice(message, target_chat_id, forwarded)
+                        LOGGER(__name__).info(f"Forwarded from private chat via Bot: {post_url}")
+                        return
+                    except Exception as e_bot_forward:
+                        LOGGER(__name__).info(f"Bot forward failed: {e_bot_forward}")
 
             # --- 1. TRY DIRECT CLONE (Optimization) ---
             # Strategies:
@@ -206,10 +311,20 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             
             # ATTEMPT A: User Client Direct
             try:
+                forwarded = None
                 if chat_message.media_group_id:
-                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    forwarded = await user.copy_media_group(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message_id
+                    )
                 else:
-                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    forwarded = await user.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_id,
+                        message_id=message_id
+                    )
+                await send_ping_notice(message, target_chat_id, forwarded)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except Exception as e_user:
@@ -217,10 +332,20 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
                 # ATTEMPT B: Bot Client Direct
                 try:
+                    forwarded = None
                     if chat_message.media_group_id:
-                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        forwarded = await bot.copy_media_group(
+                            chat_id=target_chat_id,
+                            from_chat_id=chat_id,
+                            message_id=message_id
+                        )
                     else:
-                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        forwarded = await bot.copy_message(
+                            chat_id=target_chat_id,
+                            from_chat_id=chat_id,
+                            message_id=message_id
+                        )
+                    await send_ping_notice(message, target_chat_id, forwarded)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
                 except Exception as e_bot:
@@ -234,6 +359,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                         bot_username = bot.me.username
                         LOGGER(__name__).info(f"Attempting Relay Clone via {bot_username}...")
 
+                        forwarded = None
                         if chat_message.media_group_id:
                             # 1. User copies to Bot
                             relayed_msgs = await user.copy_media_group(
@@ -243,7 +369,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                             )
                             # 2. Bot copies to Destination
                             if relayed_msgs:
-                                await bot.copy_media_group(
+                                forwarded = await bot.copy_media_group(
                                     chat_id=target_chat_id,
                                     from_chat_id=bot.me.id,
                                     message_id=relayed_msgs[0].id
@@ -256,7 +382,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                                 message_id=message_id
                             )
                             # 2. Bot copies to Destination
-                            await bot.copy_message(
+                            forwarded = await bot.copy_message(
                                 chat_id=target_chat_id,
                                 from_chat_id=bot.me.id,
                                 message_id=relayed_msg.id
@@ -267,6 +393,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                             except:
                                 pass
 
+                        await send_ping_notice(message, target_chat_id, forwarded)
                         cloned = True
                         LOGGER(__name__).info(f"Relay clone success: {post_url}")
 
@@ -321,6 +448,8 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     progress_func = progress_for_pyrogram
                     # Inject the ID into the Action Header string
                     progress_action_str = f"📥 Downloading (ID: {message_id})"
+                    if batch_label:
+                        progress_action_str = f"{batch_label} {progress_action_str}"
                     prog_args = progressArgs(progress_action_str, progress_message, start_time)
                 else:
                     progress_message = None
@@ -366,7 +495,8 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     parsed_caption,
                     progress_message, # Pass None if silent
                     start_time,
-                    destination_chat_id=target_chat_id
+                    destination_chat_id=target_chat_id,
+                    action_prefix=batch_label
                 )
 
                 cleanup_download(media_path)
@@ -408,10 +538,25 @@ async def download_media(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # NEW /BATCH INTERACTIVE FLOW
 # -------------------------------------------------------------------------------------
-@bot.on_message(filters.command("batch") & filters.private)
+@bot.on_message(filters.regex(r"^/batch(\d+)?(?:\s|$)") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
+    if not message.text:
+        return
+
+    match = re.match(r"^/batch(\d+)?(?:\s|$)", message.text.strip())
+    if not match:
+        return
+    set_key = match.group(1) or None
+
+    if set_key and set_key not in DESTINATION_SETS:
+        await message.reply(
+            f"❌ **Set {set_key} is not configured.**\n"
+            f"Use `/set{set_key} <channel_id>` first."
+        )
+        return
+
     # Set initial state
-    BATCH_STATES[message.from_user.id] = {'step': 'ask_link'}
+    BATCH_STATES[message.from_user.id] = {'step': 'ask_link', 'set_key': set_key}
     await message.reply(
         "🚀 **Batch Mode Initiated**\n\n"
         "Please send the **Start Link** of the first post you want to download."
@@ -421,6 +566,9 @@ async def batch_command_start(bot: Client, message: Message):
 # Generic Text Handler (Handles both single links AND batch conversation steps)
 @bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall", "set"]))
 async def handle_text_and_states(bot: Client, message: Message):
+    if message.text and message.text.startswith(("/batch", "/set")):
+        return
+
     # 1. Check if user is in a Batch conversation
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
@@ -450,12 +598,15 @@ async def handle_text_and_states(bot: Client, message: Message):
             
             count = int(message.text)
             start_link = BATCH_STATES[user_id]['start_link']
+            set_key = BATCH_STATES[user_id].get('set_key')
             
             # Clean up state
             del BATCH_STATES[user_id]
             
-            # Execute Batch
-            await execute_batch_logic(bot, message, start_link, count)
+            # Execute Batch in background so multiple batches can run in parallel
+            track_task(
+                execute_batch_logic(bot, message, start_link, count, set_key=set_key)
+            )
             return
 
     # 2. If not in state, treat as a single download link (if it looks like a link)
@@ -464,7 +615,13 @@ async def handle_text_and_states(bot: Client, message: Message):
 
 
 # Helper to run the batch loop
-async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
+async def execute_batch_logic(
+    bot: Client,
+    message: Message,
+    start_link: str,
+    count: int,
+    set_key: Optional[str] = None
+):
     try:
         start_chat, start_id = getChatMsgID(start_link)
     except Exception as e:
@@ -486,6 +643,9 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     skipped_streak = 0
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
+
+    destination_chat_id = DESTINATION_SETS.get(set_key) if set_key else DESTINATION_CHAT_ID
+    batch_label = f"BATCH{set_key}" if set_key else "BATCH"
 
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
@@ -522,7 +682,16 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             # But user wants progress bars. If user wants progress bars, we MUST use silent=False
             # BUT we implemented the 25s delay in utils.py so it is SAFE now.
             # So we set silent=False here to show bars as requested.
-            task = track_task(handle_download(bot, message, url, silent=False))
+            task = track_task(
+                handle_download(
+                    bot,
+                    message,
+                    url,
+                    silent=False,
+                    destination_chat_id=destination_chat_id,
+                    batch_label=batch_label
+                )
+            )
             batch_tasks.append(task)
 
             # Wait if batch size reached
