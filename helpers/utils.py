@@ -354,7 +354,8 @@ async def send_media(
     caption,
     progress_message,
     start_time,
-    destination_chat_id=None
+    destination_chat_id=None,
+    action_prefix: Optional[str] = None
 ):
     file_size = os.path.getsize(media_path)
     target_chat_id = destination_chat_id or message.chat.id
@@ -363,7 +364,10 @@ async def send_media(
         return
 
     if progress_message:
-        progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
+        action = "📤 Uploading"
+        if action_prefix:
+            action = f"{action_prefix} 📤 Uploading"
+        progress_args = progressArgs(action, progress_message, start_time)
         progress_func = progress_for_pyrogram
     else:
         progress_args = None

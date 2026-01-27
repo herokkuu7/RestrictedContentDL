@@ -254,7 +254,8 @@ async def handle_download(
     message: Message,
     post_url: str,
     silent: bool = False,
-    destination_chat_id: Optional[int] = None
+    destination_chat_id: Optional[int] = None,
+    batch_label: Optional[str] = None
 ):
     async with download_semaphore:
         if "?" in post_url:
@@ -447,6 +448,8 @@ async def handle_download(
                     progress_func = progress_for_pyrogram
                     # Inject the ID into the Action Header string
                     progress_action_str = f"📥 Downloading (ID: {message_id})"
+                    if batch_label:
+                        progress_action_str = f"{batch_label} {progress_action_str}"
                     prog_args = progressArgs(progress_action_str, progress_message, start_time)
                 else:
                     progress_message = None
@@ -492,7 +495,8 @@ async def handle_download(
                     parsed_caption,
                     progress_message, # Pass None if silent
                     start_time,
-                    destination_chat_id=target_chat_id
+                    destination_chat_id=target_chat_id,
+                    action_prefix=batch_label
                 )
 
                 cleanup_download(media_path)
@@ -639,6 +643,7 @@ async def execute_batch_logic(
     BATCH_SIZE = PyroConf.BATCH_SIZE
 
     destination_chat_id = DESTINATION_SETS.get(set_key) if set_key else DESTINATION_CHAT_ID
+    batch_label = f"BATCH{set_key}" if set_key else "BATCH"
 
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
@@ -681,7 +686,8 @@ async def execute_batch_logic(
                     message,
                     url,
                     silent=False,
-                    destination_chat_id=destination_chat_id
+                    destination_chat_id=destination_chat_id,
+                    batch_label=batch_label
                 )
             )
             batch_tasks.append(task)
