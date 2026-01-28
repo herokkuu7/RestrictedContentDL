@@ -50,7 +50,7 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1,
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -59,7 +59,7 @@ user = Client(
     "user_session",
     workers=100,
     session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1,
+    max_concurrent_transmissions=PyroConf.MAX_CONCURRENT_TRANSMISSIONS,
     sleep_threshold=30,
 )
 
@@ -105,6 +105,28 @@ def track_task(coro):
         RUNNING_TASKS.discard(task)
     task.add_done_callback(_remove)
     return task
+
+
+def build_batch_progress_text(
+    processed: int,
+    total: int,
+    downloaded: int,
+    skipped: int,
+    failed: int,
+    batch_label: str
+) -> str:
+    percentage = 0 if total == 0 else (processed * 100) / total
+    bar_len = 20
+    filled = int(percentage / 100 * bar_len)
+    bar = "▓" * filled + "░" * (bar_len - filled)
+    return (
+        f"**{batch_label} Progress**\n"
+        f"{bar} `{percentage:.2f}%`\n\n"
+        f"📌 **Processed** : `{processed}` / `{total}`\n"
+        f"📥 **Downloaded** : `{downloaded}`\n"
+        f"⏭️ **Skipped** : `{skipped}`\n"
+        f"❌ **Failed** : `{failed}`"
+    )
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -647,6 +669,30 @@ async def execute_batch_logic(
     destination_chat_id = DESTINATION_SETS.get(set_key) if set_key else DESTINATION_CHAT_ID
     batch_label = f"BATCH{set_key}" if set_key else "BATCH"
 
+    processed = 0
+    progress_message = await message.reply(
+        build_batch_progress_text(
+            processed=processed,
+            total=count,
+            downloaded=downloaded,
+            skipped=skipped,
+            failed=failed,
+            batch_label=batch_label
+        )
+    )
+
+    async def update_batch_progress():
+        await progress_message.edit(
+            build_batch_progress_text(
+                processed=processed,
+                total=count,
+                downloaded=downloaded,
+                skipped=skipped,
+                failed=failed,
+                batch_label=batch_label
+            )
+        )
+
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
@@ -660,6 +706,8 @@ async def execute_batch_logic(
 
             if not chat_msg:
                 skipped += 1
+                processed += 1
+                await update_batch_progress()
                 skipped_streak += 1
                 if skipped_streak >= BATCH_SIZE:
                     await asyncio.sleep(4)
@@ -670,6 +718,8 @@ async def execute_batch_logic(
             has_text  = bool(chat_msg.text or chat_msg.caption)
             if not (has_media or has_text):
                 skipped += 1
+                processed += 1
+                await update_batch_progress()
                 skipped_streak += 1
                 if skipped_streak >= BATCH_SIZE:
                     await asyncio.sleep(4)
@@ -700,6 +750,7 @@ async def execute_batch_logic(
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
                         await loading.delete()
+                        await progress_message.delete()
                         return await message.reply(
                             f"**❌ Batch canceled** after processing `{downloaded}` posts."
                         )
@@ -708,6 +759,9 @@ async def execute_batch_logic(
                         LOGGER(__name__).error(f"Error: {result}")
                     else:
                         downloaded += 1
+                    processed += 1
+
+                await update_batch_progress()
 
                 batch_tasks.clear()
                 # Flood wait to be safe
@@ -715,6 +769,8 @@ async def execute_batch_logic(
 
         except Exception as e:
             failed += 1
+            processed += 1
+            await update_batch_progress()
             LOGGER(__name__).error(f"Error at {url}: {e}")
 
     # Process remaining tasks
@@ -725,12 +781,16 @@ async def execute_batch_logic(
                 failed += 1
             else:
                 downloaded += 1
+            processed += 1
+
+        await update_batch_progress()
 
     await loading.delete()
+    await progress_message.delete()
     await message.reply(
         "**✅ Batch Process Complete!**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Processed** : `{downloaded}`\n"
+        f"📥 **Processed** : `{processed}`\n"
         f"⏭️ **Skipped** : `{skipped}`\n"
         f"❌ **Failed** : `{failed}`"
     )
