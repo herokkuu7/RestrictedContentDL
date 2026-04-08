@@ -13,7 +13,7 @@ from typing import Optional
 # from pyleaves import Leaves
 
 from pyrogram.enums import ParseMode
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -869,31 +869,34 @@ async def web_server():
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080)))
     await site.start()
     LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
+    return runner
+
+
+async def start_services():
+    runner = None
+    try:
+        LOGGER(__name__).info("Bot Started!")
+        await initialize()
+        await user.start()
+        await bot.start()
+        runner = await web_server()
+        await idle()
+    except KeyboardInterrupt:
+        pass
+    except Exception as err:
+        LOGGER(__name__).error(err)
+    finally:
+        if runner:
+            await runner.cleanup()
+        if bot.is_connected:
+            await bot.stop()
+        if user.is_connected:
+            await user.stop()
+        LOGGER(__name__).info("Bot Stopped")
 
 
 # -------------------------------------------------------------------------------------
 # MAIN EXECUTION
 # -------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    try:
-        LOGGER(__name__).info("Bot Started!")
-        loop = asyncio.get_event_loop()
-        
-        # Initialize semaphore
-        loop.run_until_complete(initialize())
-        
-        # Start the User Client
-        user.start()
-        
-        # Start the Dummy Web Server
-        loop.run_until_complete(web_server())
-        
-        # Start the Bot Client
-        bot.run()
-        
-    except KeyboardInterrupt:
-        pass
-    except Exception as err:
-        LOGGER(__name__).error(err)
-    finally:
-        LOGGER(__name__).info("Bot Stopped")
+    asyncio.run(start_services())
