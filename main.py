@@ -5,6 +5,7 @@ import re
 import shutil
 import psutil
 import asyncio
+import contextlib
 from time import time
 from aiohttp import web
 from typing import Optional
@@ -13,7 +14,7 @@ from typing import Optional
 # from pyleaves import Leaves
 
 from pyrogram.enums import ParseMode
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -864,36 +865,71 @@ async def web_server():
 
     app = web.Application()
     app.router.add_get('/', handle)
+    app.router.add_get('/healthz', handle)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080)))
-    await site.start()
-    LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
+
+    port = int(os.getenv('PORT', 8080))
+    site_v4 = web.TCPSite(runner, '0.0.0.0', port)
+    await site_v4.start()
+
+    # Some proxies may reach origin over IPv6; bind there when available.
+    try:
+        site_v6 = web.TCPSite(runner, '::', port)
+        await site_v6.start()
+    except OSError:
+        pass
+
+    LOGGER(__name__).info(f"Web server started on port {port}")
+    return runner
+
+
+async def run_telegram_services():
+    while True:
+        try:
+            await initialize()
+            await user.start()
+            await bot.start()
+            LOGGER(__name__).info("Telegram clients started")
+            await idle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            LOGGER(__name__).error(f"Telegram services crashed: {err}")
+            await asyncio.sleep(5)
+        finally:
+            if bot.is_connected:
+                await bot.stop()
+            if user.is_connected:
+                await user.stop()
+            LOGGER(__name__).info("Telegram clients stopped")
+
+
+async def start_services():
+    runner = None
+    telegram_task = None
+    try:
+        LOGGER(__name__).info("Bot Started!")
+        runner = await web_server()
+        telegram_task = asyncio.create_task(run_telegram_services())
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    except Exception as err:
+        LOGGER(__name__).error(err)
+    finally:
+        if telegram_task:
+            telegram_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await telegram_task
+        if runner:
+            await runner.cleanup()
+        LOGGER(__name__).info("Bot Stopped")
 
 
 # -------------------------------------------------------------------------------------
 # MAIN EXECUTION
 # -------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    try:
-        LOGGER(__name__).info("Bot Started!")
-        loop = asyncio.get_event_loop()
-        
-        # Initialize semaphore
-        loop.run_until_complete(initialize())
-        
-        # Start the User Client
-        user.start()
-        
-        # Start the Dummy Web Server
-        loop.run_until_complete(web_server())
-        
-        # Start the Bot Client
-        bot.run()
-        
-    except KeyboardInterrupt:
-        pass
-    except Exception as err:
-        LOGGER(__name__).error(err)
-    finally:
-        LOGGER(__name__).info("Bot Stopped")
+    asyncio.run(start_services())
