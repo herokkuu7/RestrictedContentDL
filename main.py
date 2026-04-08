@@ -5,6 +5,7 @@ import re
 import shutil
 import psutil
 import asyncio
+import contextlib
 from time import time
 from aiohttp import web
 from typing import Optional
@@ -884,6 +885,35 @@ async def web_server():
     return runner
 
 
+async def run_telegram_services():
+    while True:
+        try:
+            await initialize()
+            await user.start()
+            await bot.start()
+            LOGGER(__name__).info("Telegram clients started")
+            await idle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            LOGGER(__name__).error(f"Telegram services crashed: {err}")
+            await asyncio.sleep(5)
+        finally:
+            if bot.is_connected:
+                await bot.stop()
+            if user.is_connected:
+                await user.stop()
+            LOGGER(__name__).info("Telegram clients stopped")
+
+
+async def start_services():
+    runner = None
+    telegram_task = None
+    try:
+        LOGGER(__name__).info("Bot Started!")
+        runner = await web_server()
+        telegram_task = asyncio.create_task(run_telegram_services())
+        await asyncio.Event().wait()
 async def start_services():
     runner = None
     try:
@@ -898,6 +928,12 @@ async def start_services():
     except Exception as err:
         LOGGER(__name__).error(err)
     finally:
+        if telegram_task:
+            telegram_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await telegram_task
+        if runner:
+            await runner.cleanup()
         if runner:
             await runner.cleanup()
         if bot.is_connected:
