@@ -864,11 +864,23 @@ async def web_server():
 
     app = web.Application()
     app.router.add_get('/', handle)
+    app.router.add_get('/healthz', handle)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080)))
-    await site.start()
-    LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
+
+    port = int(os.getenv('PORT', 8080))
+    site_v4 = web.TCPSite(runner, '0.0.0.0', port)
+    await site_v4.start()
+
+    # Some proxies may reach origin over IPv6; bind there when available.
+    try:
+        site_v6 = web.TCPSite(runner, '::', port)
+        await site_v6.start()
+    except OSError:
+        pass
+
+    LOGGER(__name__).info(f"Web server started on port {port}")
     return runner
 
 
