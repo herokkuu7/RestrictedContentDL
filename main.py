@@ -914,6 +914,15 @@ async def start_services():
         runner = await web_server()
         telegram_task = asyncio.create_task(run_telegram_services())
         await asyncio.Event().wait()
+async def start_services():
+    runner = None
+    try:
+        LOGGER(__name__).info("Bot Started!")
+        await initialize()
+        await user.start()
+        await bot.start()
+        runner = await web_server()
+        await idle()
     except KeyboardInterrupt:
         pass
     except Exception as err:
@@ -925,6 +934,12 @@ async def start_services():
                 await telegram_task
         if runner:
             await runner.cleanup()
+        if runner:
+            await runner.cleanup()
+        if bot.is_connected:
+            await bot.stop()
+        if user.is_connected:
+            await user.stop()
         LOGGER(__name__).info("Bot Stopped")
 
 
