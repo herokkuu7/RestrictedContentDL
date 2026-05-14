@@ -7,7 +7,7 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, FileReferenceExpired
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -63,6 +63,14 @@ BATCH_STATES = {}
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
 
+
+async def resolve_target_chat_id(bot: Client):
+    if DESTINATION_CHAT_ID:
+        return DESTINATION_CHAT_ID
+    if not bot.me:
+        await bot.get_me()
+    return bot.me.id
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -106,7 +114,7 @@ async def help_command(_, message: Message):
         "   The bot will calculate the range and process them.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
-        "   – `/set none`: Reset to default (upload to this chat).\n"
+        "   – `/set none`: Reset to default (upload to the bot chat).\n"
         "     *Note: Bot must be admin in the target channel.*\n\n"
         "➤ **Requirements**\n"
         "   – Make sure the user client is part of the chat.\n\n"
@@ -138,7 +146,7 @@ async def set_destination(bot: Client, message: Message):
 
     if input_arg.lower() == "none":
         DESTINATION_CHAT_ID = None
-        await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
+        await message.reply("✅ **Destination removed.** Files will now be stored in the bot chat.")
         return
 
     try:
@@ -181,7 +189,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
-        target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
+        target_chat_id = await resolve_target_chat_id(bot)
         progress_message = None
 
         try:
@@ -282,11 +290,20 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
 
-                media_path = await chat_message.download(
-                    file_name=download_path,
-                    progress=progress_func,
-                    progress_args=prog_args, 
-                )
+                try:
+                    media_path = await chat_message.download(
+                        file_name=download_path,
+                        progress=progress_func,
+                        progress_args=prog_args,
+                    )
+                except FileReferenceExpired:
+                    LOGGER(__name__).info(f"File reference expired for {post_url}, refetching message and retrying download once.")
+                    chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+                    media_path = await chat_message.download(
+                        file_name=download_path,
+                        progress=progress_func,
+                        progress_args=prog_args,
+                    )
 
                 if not media_path or not os.path.exists(media_path):
                     if progress_message: await progress_message.edit("**❌ Download failed: File not saved properly**")
@@ -320,10 +337,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 return "success"
 
             elif chat_message.text or chat_message.caption:
-                if target_chat_id != message.chat.id:
-                    await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                else:
-                    await message.reply(parsed_text or parsed_caption)
+                await bot.send_message(target_chat_id, parsed_text or parsed_caption)
                 return "success"
             else:
                 if not silent:
@@ -428,6 +442,10 @@ async def handle_text_and_states(bot: Client, message: Message):
             return
 
     if message.text and not message.text.startswith("/"):
+        # Ignore random text in private chat; only Telegram post links should trigger /dl-like behavior.
+        if not message.text.startswith("https://t.me/"):
+            LOGGER(__name__).info(f"Ignoring non-link private message in idle mode: {message.text[:80]}")
+            return
         try:
             await track_task(handle_download(bot, message, message.text, silent=False))
         except FloodWait as e:
