@@ -442,6 +442,10 @@ async def handle_text_and_states(bot: Client, message: Message):
             return
 
     if message.text and not message.text.startswith("/"):
+        # Ignore random text in private chat; only Telegram post links should trigger /dl-like behavior.
+        if not message.text.startswith("https://t.me/"):
+            LOGGER(__name__).info(f"Ignoring non-link private message in idle mode: {message.text[:80]}")
+            return
         try:
             await track_task(handle_download(bot, message, message.text, silent=False))
         except FloodWait as e:
