@@ -7,7 +7,7 @@ from aiohttp import web
 
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, FileReferenceExpired
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -290,11 +290,20 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
 
-                media_path = await chat_message.download(
-                    file_name=download_path,
-                    progress=progress_func,
-                    progress_args=prog_args, 
-                )
+                try:
+                    media_path = await chat_message.download(
+                        file_name=download_path,
+                        progress=progress_func,
+                        progress_args=prog_args,
+                    )
+                except FileReferenceExpired:
+                    LOGGER(__name__).info(f"File reference expired for {post_url}, refetching message and retrying download once.")
+                    chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+                    media_path = await chat_message.download(
+                        file_name=download_path,
+                        progress=progress_func,
+                        progress_args=prog_args,
+                    )
 
                 if not media_path or not os.path.exists(media_path):
                     if progress_message: await progress_message.edit("**❌ Download failed: File not saved properly**")
