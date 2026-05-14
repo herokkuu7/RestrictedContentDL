@@ -63,6 +63,14 @@ BATCH_STATES = {}
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
 
+
+async def resolve_target_chat_id(bot: Client):
+    if DESTINATION_CHAT_ID:
+        return DESTINATION_CHAT_ID
+    if not bot.me:
+        await bot.get_me()
+    return bot.me.id
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -106,7 +114,7 @@ async def help_command(_, message: Message):
         "   The bot will calculate the range and process them.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
-        "   – `/set none`: Reset to default (upload to this chat).\n"
+        "   – `/set none`: Reset to default (upload to the bot chat).\n"
         "     *Note: Bot must be admin in the target channel.*\n\n"
         "➤ **Requirements**\n"
         "   – Make sure the user client is part of the chat.\n\n"
@@ -138,7 +146,7 @@ async def set_destination(bot: Client, message: Message):
 
     if input_arg.lower() == "none":
         DESTINATION_CHAT_ID = None
-        await message.reply("✅ **Destination removed.** Files will be sent to this chat.")
+        await message.reply("✅ **Destination removed.** Files will now be stored in the bot chat.")
         return
 
     try:
@@ -181,7 +189,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
-        target_chat_id = DESTINATION_CHAT_ID if DESTINATION_CHAT_ID else message.chat.id
+        target_chat_id = await resolve_target_chat_id(bot)
         progress_message = None
 
         try:
@@ -320,10 +328,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 return "success"
 
             elif chat_message.text or chat_message.caption:
-                if target_chat_id != message.chat.id:
-                    await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                else:
-                    await message.reply(parsed_text or parsed_caption)
+                await bot.send_message(target_chat_id, parsed_text or parsed_caption)
                 return "success"
             else:
                 if not silent:
