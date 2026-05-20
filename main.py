@@ -64,9 +64,11 @@ BATCH_STATES = {}
 DESTINATION_CHAT_ID = None
 
 
-async def resolve_target_chat_id(bot: Client):
+async def resolve_target_chat_id(bot: Client, source_message: Message | None = None):
     if DESTINATION_CHAT_ID:
         return DESTINATION_CHAT_ID
+    if source_message:
+        return source_message.chat.id
     if not bot.me:
         await bot.get_me()
     return bot.me.id
@@ -189,7 +191,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
 
-        target_chat_id = await resolve_target_chat_id(bot)
+        target_chat_id = await resolve_target_chat_id(bot, message)
         progress_message = None
 
         try:
