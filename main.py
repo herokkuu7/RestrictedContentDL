@@ -60,6 +60,61 @@ RUNNING_TASKS = set()
 download_semaphore = None
 BATCH_STATES = {}  
 
+PIN_PROMPTS = {}
+
+
+def build_pin_prompt_text(seconds_left: int) -> str:
+    return (
+        "📌 **Pin First Post?**\n\n"
+        "Do you want me to pin the **first post of this batch** after it is uploaded?\n"
+        f"⏳ Auto-continue without pinning in **{seconds_left}s**."
+    )
+
+
+async def finalize_pin_prompt(user_id: int, timed_out: bool = False):
+    prompt = PIN_PROMPTS.get(user_id)
+    if not prompt or prompt.get("done"):
+        return
+
+    prompt["done"] = True
+    event = prompt["event"]
+    if not event.is_set():
+        event.set()
+
+    try:
+        await prompt["prompt_msg"].edit(
+            "⏱️ No selection received in 10 seconds. Proceeding without pinning."
+            if timed_out
+            else ("✅ Pin enabled for this batch." if prompt["pin_first"] else "➡️ Proceeding without pinning.")
+        )
+    except Exception:
+        pass
+
+
+async def pin_prompt_countdown(user_id: int):
+    prompt = PIN_PROMPTS.get(user_id)
+    if not prompt:
+        return
+
+    intervals = [7, 4, 1]
+    for seconds_left in intervals:
+        await asyncio.sleep(3)
+        current = PIN_PROMPTS.get(user_id)
+        if not current or current.get("done"):
+            return
+        try:
+            await current["prompt_msg"].edit(
+                build_pin_prompt_text(seconds_left),
+                reply_markup=current["markup"]
+            )
+        except Exception:
+            return
+
+    await asyncio.sleep(1)
+    current = PIN_PROMPTS.get(user_id)
+    if current and not current.get("done"):
+        await finalize_pin_prompt(user_id, timed_out=True)
+
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
 
@@ -208,9 +263,9 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             # --- CLONE ATTEMPTS ---
             try:
                 if chat_message.media_group_id:
-                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_group = await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 else:
-                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_msg = await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except FloodWait as e:
@@ -220,9 +275,9 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
                 try:
                     if chat_message.media_group_id:
-                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     else:
-                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
                 except FloodWait as e:
@@ -238,10 +293,10 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                         if chat_message.media_group_id:
                             relayed_msgs = await user.copy_media_group(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
                             if relayed_msgs:
-                                await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
+                                copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
                         else:
                             relayed_msg = await user.copy_message(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
-                            await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
+                            copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
                             try:
                                 await relayed_msg.delete()
                             except:
@@ -256,7 +311,12 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
             if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                return "success"
+                sent_msg_id = None
+                if "copied_group" in locals() and copied_group:
+                    sent_msg_id = copied_group[0].id
+                elif "copied_msg" in locals() and copied_msg:
+                    sent_msg_id = copied_msg.id
+                return {"status": "success", "sent_msg_id": sent_msg_id}
 
             # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -272,10 +332,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
 
             if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id):
+                sent_msg_id = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
+                if not sent_msg_id:
                     if not silent:
                         await message.reply("**Could not extract any valid media from the media group.**")
-                return "success"
+                return {"status": "success", "sent_msg_id": sent_msg_id}
 
             elif chat_message.media:
                 start_time = time()
@@ -326,7 +387,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     else "document"
                 )
                 
-                await send_media(
+                sent_msg = await send_media(
                     bot, message, media_path, media_type, parsed_caption,
                     progress_message, start_time, destination_chat_id=target_chat_id
                 )
@@ -336,11 +397,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if progress_message:
                     await progress_message.delete()
                     
-                return "success"
+                return {"status": "success", "sent_msg_id": sent_msg.id if sent_msg else None}
 
             elif chat_message.text or chat_message.caption:
-                await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                return "success"
+                sent_msg = await bot.send_message(target_chat_id, parsed_text or parsed_caption)
+                return {"status": "success", "sent_msg_id": sent_msg.id}
             else:
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
@@ -439,8 +500,31 @@ async def handle_text_and_states(bot: Client, message: Message):
             start_link = BATCH_STATES[user_id]['start_link']
             
             del BATCH_STATES[user_id]
-            
-            await execute_batch_logic(bot, message, start_link, count)
+
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes", callback_data=f"pin_decision:yes:{user_id}"),
+                InlineKeyboardButton("❌ No", callback_data=f"pin_decision:no:{user_id}"),
+            ]])
+            prompt_msg = await message.reply(build_pin_prompt_text(10), reply_markup=markup)
+
+            decision_event = asyncio.Event()
+            PIN_PROMPTS[user_id] = {
+                "event": decision_event,
+                "start_link": start_link,
+                "count": count,
+                "pin_first": False,
+                "done": False,
+                "prompt_msg": prompt_msg,
+                "markup": markup,
+            }
+
+            track_task(pin_prompt_countdown(user_id))
+            await decision_event.wait()
+
+            prompt = PIN_PROMPTS.pop(user_id, None)
+            pin_first = prompt.get("pin_first", False) if prompt else False
+
+            await execute_batch_logic(bot, message, start_link, count, pin_first=pin_first)
             return
 
     if message.text and not message.text.startswith("/"):
@@ -455,7 +539,7 @@ async def handle_text_and_states(bot: Client, message: Message):
 
 
 # Helper to run the batch loop (NOW HIGHLY OPTIMIZED WITH BULK FETCH)
-async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
+async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int, pin_first: bool = False):
     try:
         start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
@@ -473,6 +557,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     )
 
     downloaded = skipped = failed = 0
+    first_pinned_msg_id = None
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
     
@@ -537,10 +622,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                 for result in results:
-                    if result == "aborted" or abort_event.is_set():
+                    status = result.get("status") if isinstance(result, dict) else result
+                    if status == "aborted" or abort_event.is_set():
                         pass 
-                    elif result == "success":
+                    elif status == "success":
                         downloaded += 1
+                        if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
+                            first_pinned_msg_id = result.get("sent_msg_id")
                     else:
                         failed += 1
                 
@@ -551,10 +639,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     if batch_tasks and not abort_event.is_set():
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
-            if result == "aborted" or abort_event.is_set():
+            status = result.get("status") if isinstance(result, dict) else result
+            if status == "aborted" or abort_event.is_set():
                 pass
-            elif result == "success":
+            elif status == "success":
                 downloaded += 1
+                if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
+                    first_pinned_msg_id = result.get("sent_msg_id")
             else:
                 failed += 1
 
@@ -562,6 +653,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     
     completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
     
+    if pin_first and first_pinned_msg_id:
+        try:
+            target_chat_id = await resolve_target_chat_id(bot, message)
+            await bot.pin_chat_message(target_chat_id, first_pinned_msg_id, disable_notification=True)
+        except Exception as e:
+            LOGGER(__name__).info(f"Could not pin first batch post: {e}")
+
     await message.reply(
         f"{completion_text}\n"
         "━━━━━━━━━━━━━━━━━━━\n"
@@ -597,6 +695,29 @@ async def logs(_, message: Message):
         await message.reply_document(document="logs.txt", caption="**Logs**")
     else:
         await message.reply("**Not exists**")
+
+
+@bot.on_callback_query(filters.regex(r"^pin_decision:(yes|no):(\d+)$"))
+async def pin_decision_callback(_, query):
+    choice, owner_id_str = query.data.split(":")[1:]
+    owner_id = int(owner_id_str)
+
+    if not query.from_user or query.from_user.id != owner_id:
+        await query.answer("This prompt is not for you.", show_alert=True)
+        return
+
+    prompt = PIN_PROMPTS.get(owner_id)
+    if not prompt:
+        await query.answer("This decision prompt is no longer active.", show_alert=True)
+        return
+
+    if prompt.get("done"):
+        await query.answer("Decision already recorded.")
+        return
+
+    prompt["pin_first"] = choice == "yes"
+    await finalize_pin_prompt(owner_id, timed_out=False)
+    await query.answer("Decision saved.")
 
 
 @bot.on_callback_query(filters.regex("^refresh_progress$"))
