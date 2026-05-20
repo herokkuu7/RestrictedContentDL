@@ -369,7 +369,7 @@ async def send_media(
 
     try:
         if media_type == "photo":
-            await bot.send_photo(target_chat_id, media_path, **send_kwargs)
+            return await bot.send_photo(target_chat_id, media_path, **send_kwargs)
 
         elif media_type == "video":
             duration, _, _, width, height = await get_media_info(media_path)
@@ -377,7 +377,7 @@ async def send_media(
             height = height or 480
             thumb = await get_video_thumbnail(media_path, duration)
 
-            await bot.send_video(
+            return await bot.send_video(
                 target_chat_id,
                 media_path,
                 duration=duration,
@@ -390,7 +390,7 @@ async def send_media(
 
         elif media_type == "audio":
             duration, artist, title, _, _ = await get_media_info(media_path)
-            await bot.send_audio(
+            return await bot.send_audio(
                 target_chat_id,
                 media_path,
                 duration=duration,
@@ -400,10 +400,12 @@ async def send_media(
             )
 
         elif media_type == "document":
-            await bot.send_document(target_chat_id, media_path, **send_kwargs)
+            return await bot.send_document(target_chat_id, media_path, **send_kwargs)
 
     except Exception as e:
         LOGGER(__name__).error(f"Error sending media: {e}")
+
+    return None
 
 
 async def download_single_media(msg, progress_message, start_time):
@@ -471,29 +473,30 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
 
     if valid_media:
         try:
-            await bot.send_media_group(target_chat_id, valid_media)
+            sent_group = await bot.send_media_group(target_chat_id, valid_media)
             await progress_message.delete()
         except Exception:
+            sent_group = []
             for media in valid_media:
                 try:
                     if isinstance(media, InputMediaPhoto):
-                        await bot.send_photo(target_chat_id, media.media, media.caption)
+                        sent_group.append(await bot.send_photo(target_chat_id, media.media, media.caption))
                     elif isinstance(media, InputMediaVideo):
-                        await bot.send_video(target_chat_id, media.media, caption=media.caption)
+                        sent_group.append(await bot.send_video(target_chat_id, media.media, caption=media.caption))
                     elif isinstance(media, InputMediaDocument):
-                        await bot.send_document(target_chat_id, media.media, caption=media.caption)
+                        sent_group.append(await bot.send_document(target_chat_id, media.media, caption=media.caption))
                     elif isinstance(media, InputMediaAudio):
-                        await bot.send_audio(target_chat_id, media.media, caption=media.caption)
+                        sent_group.append(await bot.send_audio(target_chat_id, media.media, caption=media.caption))
                 except Exception:
                     pass
 
         for path in temp_paths + invalid_paths:
             cleanup_download(path)
 
-        return True
+        return sent_group[0].id if sent_group else None
 
     await progress_message.delete()
     for path in invalid_paths:
         cleanup_download(path)
 
-    return False
+    return None

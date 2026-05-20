@@ -263,9 +263,9 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             # --- CLONE ATTEMPTS ---
             try:
                 if chat_message.media_group_id:
-                    await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_group = await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 else:
-                    await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_msg = await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except FloodWait as e:
@@ -275,9 +275,9 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
                 try:
                     if chat_message.media_group_id:
-                        await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     else:
-                        await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                        copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
                     cloned = True
                     LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
                 except FloodWait as e:
@@ -293,10 +293,10 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                         if chat_message.media_group_id:
                             relayed_msgs = await user.copy_media_group(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
                             if relayed_msgs:
-                                await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
+                                copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
                         else:
                             relayed_msg = await user.copy_message(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
-                            await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
+                            copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
                             try:
                                 await relayed_msg.delete()
                             except:
@@ -311,7 +311,12 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
             if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                return "success"
+                sent_msg_id = None
+                if "copied_group" in locals() and copied_group:
+                    sent_msg_id = copied_group[0].id
+                elif "copied_msg" in locals() and copied_msg:
+                    sent_msg_id = copied_msg.id
+                return {"status": "success", "sent_msg_id": sent_msg_id}
 
             # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -327,10 +332,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
 
             if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id):
+                sent_msg_id = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
+                if not sent_msg_id:
                     if not silent:
                         await message.reply("**Could not extract any valid media from the media group.**")
-                return "success"
+                return {"status": "success", "sent_msg_id": sent_msg_id}
 
             elif chat_message.media:
                 start_time = time()
@@ -381,7 +387,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     else "document"
                 )
                 
-                await send_media(
+                sent_msg = await send_media(
                     bot, message, media_path, media_type, parsed_caption,
                     progress_message, start_time, destination_chat_id=target_chat_id
                 )
@@ -391,11 +397,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if progress_message:
                     await progress_message.delete()
                     
-                return "success"
+                return {"status": "success", "sent_msg_id": sent_msg.id if sent_msg else None}
 
             elif chat_message.text or chat_message.caption:
-                await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                return "success"
+                sent_msg = await bot.send_message(target_chat_id, parsed_text or parsed_caption)
+                return {"status": "success", "sent_msg_id": sent_msg.id}
             else:
                 if not silent:
                     await message.reply("**No media or text found in the post URL.**")
@@ -551,6 +557,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     )
 
     downloaded = skipped = failed = 0
+    first_pinned_msg_id = None
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
     
@@ -615,10 +622,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                 for result in results:
-                    if result == "aborted" or abort_event.is_set():
+                    status = result.get("status") if isinstance(result, dict) else result
+                    if status == "aborted" or abort_event.is_set():
                         pass 
-                    elif result == "success":
+                    elif status == "success":
                         downloaded += 1
+                        if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
+                            first_pinned_msg_id = result.get("sent_msg_id")
                     else:
                         failed += 1
                 
@@ -629,10 +639,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     if batch_tasks and not abort_event.is_set():
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
-            if result == "aborted" or abort_event.is_set():
+            status = result.get("status") if isinstance(result, dict) else result
+            if status == "aborted" or abort_event.is_set():
                 pass
-            elif result == "success":
+            elif status == "success":
                 downloaded += 1
+                if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
+                    first_pinned_msg_id = result.get("sent_msg_id")
             else:
                 failed += 1
 
@@ -640,10 +653,10 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     
     completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
     
-    if pin_first:
+    if pin_first and first_pinned_msg_id:
         try:
             target_chat_id = await resolve_target_chat_id(bot, message)
-            await bot.pin_chat_message(target_chat_id, start_id, disable_notification=True)
+            await bot.pin_chat_message(target_chat_id, first_pinned_msg_id, disable_notification=True)
         except Exception as e:
             LOGGER(__name__).info(f"Could not pin first batch post: {e}")
 
