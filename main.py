@@ -124,9 +124,11 @@ async def resolve_target_chat_id(bot: Client, source_message: Message | None = N
         return DESTINATION_CHAT_ID
     if source_message:
         return source_message.chat.id
-    if not bot.me:
-        await bot.get_me()
-    return bot.me.id
+    raise ValueError("source_message is required when no destination chat is configured")
+
+
+def has_custom_destination() -> bool:
+    return DESTINATION_CHAT_ID is not None
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -261,18 +263,27 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             cloned = False
             
             # --- CLONE ATTEMPTS ---
-            try:
-                if chat_message.media_group_id:
-                    copied_group = await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                else:
-                    copied_msg = await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                cloned = True
-                LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
-            except FloodWait as e:
-                raise e # DO NOT MASK FLOODWAIT!
-            except Exception as e_user:
-                LOGGER(__name__).info(f"User direct clone failed: {e_user}")
+            # When no destination channel is configured, target_chat_id is the user's
+            # private chat with the bot. The user session cannot copy directly there:
+            # chat_id=<user id> means the user's own Saved Messages. In that default
+            # mode, skip the direct user copy and let the bot send to the command chat
+            # or relay through the bot conversation.
+            if has_custom_destination():
+                try:
+                    if chat_message.media_group_id:
+                        copied_group = await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    else:
+                        copied_msg = await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    cloned = True
+                    LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
+                except FloodWait as e:
+                    raise e # DO NOT MASK FLOODWAIT!
+                except Exception as e_user:
+                    LOGGER(__name__).info(f"User direct clone failed: {e_user}")
+            else:
+                LOGGER(__name__).info("Skipping direct user clone because no destination channel is set")
 
+            if not cloned:
                 try:
                     if chat_message.media_group_id:
                         copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
@@ -299,7 +310,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                             copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
                             try:
                                 await relayed_msg.delete()
-                            except:
+                            except Exception:
                                 pass
                         cloned = True
                         LOGGER(__name__).info(f"Relay clone success: {post_url}")
