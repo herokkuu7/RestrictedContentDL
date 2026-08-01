@@ -304,10 +304,21 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                         if chat_message.media_group_id:
                             relayed_msgs = await user.copy_media_group(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
                             if relayed_msgs:
-                                copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
+                                # The relayed messages live in the private chat between
+                                # the user session and the bot. From the bot side, that
+                                # chat id is the user account id, not bot.me.id.
+                                copied_group = await bot.copy_media_group(
+                                    chat_id=target_chat_id,
+                                    from_chat_id=relayed_msgs[0].chat.id,
+                                    message_id=relayed_msgs[0].id
+                                )
                         else:
                             relayed_msg = await user.copy_message(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
-                            copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
+                            copied_msg = await bot.copy_message(
+                                chat_id=target_chat_id,
+                                from_chat_id=relayed_msg.chat.id,
+                                message_id=relayed_msg.id
+                            )
                             try:
                                 await relayed_msg.delete()
                             except Exception:
