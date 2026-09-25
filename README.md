@@ -19,6 +19,7 @@
 - ✅ Supports downloading from both single media posts and media groups.
 - 🔄 Progress bar showing real-time downloading progress.
 - ✍️ Copy text messages or captions from Telegram posts.
+- 📌 Batch mode asks whether to pin the first post of the batch (tap a button or reply `yes` / `no`).
 
 ## Requirements
 

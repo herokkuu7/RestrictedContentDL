@@ -62,58 +62,202 @@ BATCH_STATES = {}
 
 PIN_PROMPTS = {}
 
+# How long the user has to answer the "pin the first post?" prompt.
+PIN_PROMPT_TIMEOUT = PyroConf.PIN_PROMPT_TIMEOUT
+
+# "seconds left" values shown while the prompt counts down.
+PIN_COUNTDOWN_MARKS = (45, 30, 15, 5)
+
+PIN_YES_ANSWERS = {"yes", "y", "yeah", "yep", "ya", "pin", "1", "✅", "👍"}
+PIN_NO_ANSWERS = {"no", "n", "nope", "nah", "skip", "0", "❌", "👎"}
+
+
+def new_pin_decision() -> dict:
+    """Mutable pin state shared by the prompt, the callback and the batch loop."""
+    return {
+        "pin_first": False,
+        "bot": None,
+        "chat_id": None,
+        "first_msg_id": None,
+        "pinned": False,
+        "pinning": False,
+        "batch_started": False,
+    }
+
 
 def build_pin_prompt_text(seconds_left: int) -> str:
     return (
-        "📌 **Pin First Post?**\n\n"
-        "Do you want me to pin the **first post of this batch** after it is uploaded?\n"
-        f"⏳ Auto-continue without pinning in **{seconds_left}s**."
+        "📌 **Pin the first post of this batch?**\n\n"
+        "Say **Yes** and I will pin the **first post** of this batch to the top of the "
+        "destination chat as soon as it is uploaded.\n\n"
+        f"⏳ No answer in **{seconds_left}s** → the batch continues **without pinning**.\n"
+        "Tap a button below, or simply reply `yes` / `no`."
     )
 
 
-async def finalize_pin_prompt(user_id: int, timed_out: bool = False):
-    prompt = PIN_PROMPTS.get(user_id)
-    if not prompt or prompt.get("done"):
-        return
+def build_pin_status_text(pin_first: bool) -> str:
+    if pin_first:
+        return "✅ **Pin enabled** — I will pin the first post of this batch."
+    return "➡️ **No pinning** for this batch."
 
-    prompt["done"] = True
-    event = prompt["event"]
-    if not event.is_set():
+
+def pin_answer_alert(pin_first: bool) -> str:
+    return "Pin enabled for this batch." if pin_first else "No pinning for this batch."
+
+
+def parse_pin_answer(text: str):
+    """Return True/False when the text clearly answers the pin prompt, else None."""
+    if not text:
+        return None
+    answer = text.strip().lower()
+    if answer in PIN_YES_ANSWERS:
+        return True
+    if answer in PIN_NO_ANSWERS:
+        return False
+    return None
+
+
+async def pin_first_post(decision: dict, notify=None) -> bool:
+    """Pin the first uploaded post of the batch (at most once)."""
+    if decision.get("pinned"):
+        return True
+    if decision.get("pinning"):
+        return False
+
+    msg_id = decision.get("first_msg_id")
+    chat_id = decision.get("chat_id")
+    bot_client = decision.get("bot")
+    if not msg_id or chat_id is None or bot_client is None:
+        return False
+
+    decision["pinning"] = True
+    try:
+        await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True)
+    except Exception as e:
+        decision["pinning"] = False
+        LOGGER(__name__).warning(f"Could not pin message {msg_id} in chat {chat_id}: {e}")
+        if notify:
+            try:
+                await notify(
+                    "⚠️ **Could not pin the first post of this batch.**\n"
+                    f"**Telegram said:** `{e}`\n\n"
+                    "For a channel or group destination the bot must be an **admin** there "
+                    "with the **Pin messages** permission."
+                )
+            except Exception:
+                pass
+        return False
+
+    decision["pinning"] = False
+    decision["pinned"] = True
+    LOGGER(__name__).info(f"Pinned first post of batch: chat={chat_id} message={msg_id}")
+    if notify:
+        try:
+            await notify("📌 **Pinned** the first post of this batch.")
+        except Exception:
+            pass
+    return True
+
+
+async def unpin_first_post(decision: dict, notify=None) -> bool:
+    """Undo the pin when the user changes their mind while the batch is running."""
+    if not decision.get("pinned"):
+        return False
+    try:
+        await decision["bot"].unpin_chat_message(decision["chat_id"], decision["first_msg_id"])
+    except Exception as e:
+        LOGGER(__name__).warning(f"Could not unpin the first batch post: {e}")
+        return False
+
+    decision["pinned"] = False
+    if notify:
+        try:
+            await notify("📌 **Unpinned** the first post of this batch.")
+        except Exception:
+            pass
+    return True
+
+
+async def apply_pin_decision(user_id: int, pin_first: bool, query=None) -> bool:
+    """Record the user's choice and release the batch that waits on the prompt."""
+    prompt = PIN_PROMPTS.get(user_id)
+    if not prompt or prompt.get("cancelled"):
+        return False
+
+    pin_first = bool(pin_first)
+    decision = prompt["decision"]
+    first_decision = not prompt.get("decided")
+    changed = prompt.get("current_choice") != pin_first
+
+    prompt["current_choice"] = pin_first
+    decision["pin_first"] = pin_first
+
+    if first_decision:
+        prompt["decided"] = True
+        event = prompt.get("event")
+        if event and not event.is_set():
+            event.set()
+
+    if (first_decision or changed) and pin_first and decision.get("batch_started") \
+            and decision.get("first_msg_id") and not decision.get("pinned"):
+        # Answered late, while the batch is already uploading: pin right away.
+        await pin_first_post(decision, notify=prompt.get("notify"))
+    elif (first_decision or changed) and not pin_first and decision.get("pinned"):
+        await unpin_first_post(decision, notify=prompt.get("notify"))
+
+    if first_decision or changed:
+        try:
+            await prompt["prompt_msg"].edit(
+                build_pin_status_text(pin_first),
+                reply_markup=prompt.get("markup")
+            )
+        except Exception:
+            pass
+
+    if query is not None:
+        await query.answer(pin_answer_alert(pin_first))
+    return True
+
+
+async def release_pending_prompt(user_id: int, status_text: str = None, expect: dict = None) -> bool:
+    """Close the pin prompt (dropping its buttons) and release any waiter."""
+    prompt = PIN_PROMPTS.get(user_id)
+    if not prompt or (expect is not None and prompt is not expect):
+        return False
+
+    PIN_PROMPTS.pop(user_id, None)
+    prompt["decided"] = True
+    prompt["cancelled"] = True
+
+    event = prompt.get("event")
+    if event and not event.is_set():
         event.set()
 
-    try:
-        await prompt["prompt_msg"].edit(
-            "⏱️ No selection received in 10 seconds. Proceeding without pinning."
-            if timed_out
-            else ("✅ Pin enabled for this batch." if prompt["pin_first"] else "➡️ Proceeding without pinning.")
-        )
-    except Exception:
-        pass
+    if status_text:
+        try:
+            await prompt["prompt_msg"].edit(status_text)
+        except Exception:
+            pass
+    return True
 
 
 async def pin_prompt_countdown(user_id: int):
-    prompt = PIN_PROMPTS.get(user_id)
-    if not prompt:
-        return
-
-    intervals = [7, 4, 1]
-    for seconds_left in intervals:
-        await asyncio.sleep(3)
-        current = PIN_PROMPTS.get(user_id)
-        if not current or current.get("done"):
+    """Tick the prompt text down; the hard deadline is enforced by the waiter."""
+    marks = [m for m in PIN_COUNTDOWN_MARKS if 0 < m < PIN_PROMPT_TIMEOUT]
+    previous = PIN_PROMPT_TIMEOUT
+    for seconds_left in marks:
+        await asyncio.sleep(max(previous - seconds_left, 0))
+        previous = seconds_left
+        prompt = PIN_PROMPTS.get(user_id)
+        if not prompt or prompt.get("decided") or prompt.get("cancelled"):
             return
         try:
-            await current["prompt_msg"].edit(
+            await prompt["prompt_msg"].edit(
                 build_pin_prompt_text(seconds_left),
-                reply_markup=current["markup"]
+                reply_markup=prompt.get("markup")
             )
         except Exception:
             return
-
-    await asyncio.sleep(1)
-    current = PIN_PROMPTS.get(user_id)
-    if current and not current.get("done"):
-        await finalize_pin_prompt(user_id, timed_out=True)
 
 # GLOBAL SETTING FOR DESTINATION CHANNEL
 DESTINATION_CHAT_ID = None
@@ -146,7 +290,8 @@ async def start(_, message: Message):
         "or reply to a message with `/dl`.\n\n"
         "**New Feature:**\n"
         "Use `/batch` to clone/download multiple messages easily!\n"
-        "Use `/set <channel_id>` to set a custom upload destination.\n\n"
+        "Use `/set <channel_id>` to set a custom upload destination.\n"
+        "Batch mode first asks whether to **pin the first post** — tap a button or reply `yes` / `no`.\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
         "🔒 Make sure the user client is part of the chat.\n\n"
         "Ready? Send me a Telegram post link!"
@@ -168,6 +313,8 @@ async def help_command(_, message: Message):
         "   1. Send `/batch`\n"
         "   2. Send the **Start Link**\n"
         "   3. Send the **Number of Messages** (e.g., 100)\n"
+        "   4. Answer the **📌 Pin the first post?** prompt (button, or reply `yes` / `no`) —\n"
+        f"      it auto-continues without pinning after {PyroConf.PIN_PROMPT_TIMEOUT}s.\n"
         "   The bot will calculate the range and process them.\n\n"
         "➤ **Destination Settings**\n"
         "   – `/set -100xxxx`: Set a channel for uploads.\n"
@@ -464,7 +611,13 @@ async def download_media_cmd(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 @bot.on_message(filters.command("batch") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
-    BATCH_STATES[message.from_user.id] = {'step': 'ask_link'}
+    user_id = message.from_user.id
+    # Never leave a previous prompt open: the batch waiting on it would hang.
+    await release_pending_prompt(
+        user_id,
+        "⌛ A new /batch was started, so this pin prompt is closed."
+    )
+    BATCH_STATES[user_id] = {'step': 'ask_link'}
     await message.reply(
         "🚀 **Batch Mode Initiated**\n\n"
         "Please send the **Start Link** of the first post you want to download."
@@ -481,7 +634,7 @@ async def handle_text_and_states(bot: Client, message: Message):
             if not message.text.startswith("https://t.me/"):
                 await message.reply("❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
                 return
-            
+
             BATCH_STATES[user_id]['start_link'] = message.text
             BATCH_STATES[user_id]['step'] = 'ask_count'
             await message.reply(
@@ -495,36 +648,70 @@ async def handle_text_and_states(bot: Client, message: Message):
             if not message.text.isdigit():
                 await message.reply("❌ Please send a valid number.")
                 return
-            
+
             count = int(message.text)
             start_link = BATCH_STATES[user_id]['start_link']
-            
+
             del BATCH_STATES[user_id]
 
             markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes", callback_data=f"pin_decision:yes:{user_id}"),
+                InlineKeyboardButton("✅ Yes, pin it", callback_data=f"pin_decision:yes:{user_id}"),
                 InlineKeyboardButton("❌ No", callback_data=f"pin_decision:no:{user_id}"),
             ]])
-            prompt_msg = await message.reply(build_pin_prompt_text(10), reply_markup=markup)
+            prompt_msg = await message.reply(build_pin_prompt_text(PIN_PROMPT_TIMEOUT), reply_markup=markup)
 
             decision_event = asyncio.Event()
-            PIN_PROMPTS[user_id] = {
+            pin_prompt = {
                 "event": decision_event,
                 "start_link": start_link,
                 "count": count,
-                "pin_first": False,
-                "done": False,
                 "prompt_msg": prompt_msg,
                 "markup": markup,
+                "notify": message.reply,
+                "decided": False,
+                "cancelled": False,
+                "current_choice": None,
+                "decision": new_pin_decision(),
             }
-
+            PIN_PROMPTS[user_id] = pin_prompt
             track_task(pin_prompt_countdown(user_id))
-            await decision_event.wait()
 
-            prompt = PIN_PROMPTS.pop(user_id, None)
-            pin_first = prompt.get("pin_first", False) if prompt else False
+            # Wait for the answer, but ALWAYS continue afterwards: a cancelled countdown
+            # task or a /killall must never leave the batch stuck on this prompt.
+            try:
+                await asyncio.wait_for(decision_event.wait(), timeout=PIN_PROMPT_TIMEOUT)
+            except asyncio.TimeoutError:
+                current = PIN_PROMPTS.get(user_id)
+                if current is pin_prompt and not current.get("decided"):
+                    current["decided"] = True
+                    current["current_choice"] = False
+                    current["decision"]["pin_first"] = False
+                    try:
+                        await current["prompt_msg"].edit(
+                            f"⏱️ **No answer in {PIN_PROMPT_TIMEOUT}s** — starting the batch "
+                            "**without pinning**.\n"
+                            "Changed your mind? Tap **✅ Yes, pin it** while the batch is running, "
+                            "or reply `yes`.",
+                            reply_markup=current.get("markup")
+                        )
+                    except Exception:
+                        pass
 
-            await execute_batch_logic(bot, message, start_link, count, pin_first=pin_first)
+            if pin_prompt.get("cancelled"):
+                LOGGER(__name__).info(f"Pin prompt for {user_id} was closed before the batch started.")
+                return
+
+            await execute_batch_logic(
+                bot, message, start_link, count,
+                pin_decision=pin_prompt["decision"],
+                pin_prompt=pin_prompt
+            )
+            return
+
+    if message.text:
+        answer = parse_pin_answer(message.text)
+        if answer is not None and user_id in PIN_PROMPTS:
+            await apply_pin_decision(user_id, answer)
             return
 
     if message.text and not message.text.startswith("/"):
@@ -539,7 +726,16 @@ async def handle_text_and_states(bot: Client, message: Message):
 
 
 # Helper to run the batch loop (NOW HIGHLY OPTIMIZED WITH BULK FETCH)
-async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int, pin_first: bool = False):
+async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int,
+                              pin_decision: dict = None, pin_prompt: dict = None):
+    """Run the batch loop.
+
+    `pin_decision` is the mutable pin state owned by the /batch prompt, so a choice
+    made *while* the batch is already running (or after the auto-continue) is honoured.
+    """
+    if pin_decision is None:
+        pin_decision = new_pin_decision()
+
     try:
         start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
@@ -547,7 +743,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
     end_id = start_id + count - 1
     prefix = start_link.rsplit("/", 1)[0]
-    
+
     thread_text = f"\n**Topic/Thread Filter Active**: ID `{start_thread_id}`" if start_thread_id else ""
     loading = await message.reply(
         f"📥 **Starting Batch Process**\n"
@@ -557,11 +753,31 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     )
 
     downloaded = skipped = failed = 0
-    first_pinned_msg_id = None
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
-    
+
     abort_event = asyncio.Event() # Shared flag to shut everything down
+
+    pin_decision["bot"] = bot
+    pin_decision["chat_id"] = await resolve_target_chat_id(bot, message)
+    pin_decision["batch_started"] = True
+
+    async def consume_results(results):
+        """Tally a finished chunk and pin the first uploaded post exactly once."""
+        nonlocal downloaded, failed
+        for result in results:
+            status = result.get("status") if isinstance(result, dict) else result
+            if status == "aborted" or abort_event.is_set():
+                continue
+            if status == "success":
+                downloaded += 1
+                if isinstance(result, dict) and result.get("sent_msg_id") and not pin_decision.get("first_msg_id"):
+                    pin_decision["first_msg_id"] = result["sent_msg_id"]
+            else:
+                failed += 1
+
+        if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
+            await pin_first_post(pin_decision, notify=message.reply)
 
     all_message_ids = list(range(start_id, end_id + 1))
     chunk_size = 50 # Fetch 50 messages per API call (Instant skipping)
@@ -569,9 +785,9 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     for i in range(0, len(all_message_ids), chunk_size):
         if abort_event.is_set():
             break
-            
+
         chunk = all_message_ids[i:i+chunk_size]
-        
+
         try:
             # OPTIMIZATION: Fetch in bulk to save API rate limits!
             messages_batch = await user.get_messages(chat_id=start_chat, message_ids=chunk)
@@ -621,44 +837,32 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                for result in results:
-                    status = result.get("status") if isinstance(result, dict) else result
-                    if status == "aborted" or abort_event.is_set():
-                        pass 
-                    elif status == "success":
-                        downloaded += 1
-                        if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
-                            first_pinned_msg_id = result.get("sent_msg_id")
-                    else:
-                        failed += 1
-                
+                await consume_results(results)
+
                 batch_tasks.clear()
                 if not abort_event.is_set():
                     await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
     if batch_tasks and not abort_event.is_set():
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        for result in results:
-            status = result.get("status") if isinstance(result, dict) else result
-            if status == "aborted" or abort_event.is_set():
-                pass
-            elif status == "success":
-                downloaded += 1
-                if pin_first and first_pinned_msg_id is None and isinstance(result, dict):
-                    first_pinned_msg_id = result.get("sent_msg_id")
-            else:
-                failed += 1
+        await consume_results(results)
 
     await loading.delete()
-    
+
     completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
-    
-    if pin_first and first_pinned_msg_id:
-        try:
-            target_chat_id = await resolve_target_chat_id(bot, message)
-            await bot.pin_chat_message(target_chat_id, first_pinned_msg_id, disable_notification=True)
-        except Exception as e:
-            LOGGER(__name__).info(f"Could not pin first batch post: {e}")
+
+    # A "Yes" that arrived late (after the auto-continue) is still honoured here.
+    if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
+        await pin_first_post(pin_decision, notify=message.reply)
+
+    if pin_prompt is not None:
+        await release_pending_prompt(
+            message.from_user.id,
+            "📌 Pin prompt closed — the first post of this batch is pinned."
+            if pin_decision.get("pinned")
+            else "⌛ Pin prompt closed — nothing was pinned.",
+            expect=pin_prompt
+        )
 
     await message.reply(
         f"{completion_text}\n"
@@ -667,7 +871,6 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         f"⏭️ **Skipped** : `{skipped}`\n"
         f"❌ **Failed** : `{failed}`"
     )
-
 
 @bot.on_message(filters.command("stats") & filters.private)
 async def stats(_, message: Message):
@@ -699,26 +902,20 @@ async def logs(_, message: Message):
 
 @bot.on_callback_query(filters.regex(r"^pin_decision:(yes|no):(\d+)$"))
 async def pin_decision_callback(_, query):
-    choice, owner_id_str = query.data.split(":")[1:]
-    owner_id = int(owner_id_str)
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    choice, owner_id = parts[1], int(parts[2])
 
     if not query.from_user or query.from_user.id != owner_id:
         await query.answer("This prompt is not for you.", show_alert=True)
         return
 
-    prompt = PIN_PROMPTS.get(owner_id)
-    if not prompt:
-        await query.answer("This decision prompt is no longer active.", show_alert=True)
-        return
-
-    if prompt.get("done"):
-        await query.answer("Decision already recorded.")
-        return
-
-    prompt["pin_first"] = choice == "yes"
-    await finalize_pin_prompt(owner_id, timed_out=False)
-    await query.answer("Decision saved.")
-
+    applied = await apply_pin_decision(owner_id, choice == "yes", query=query)
+    if not applied:
+        await query.answer("This pin prompt is already closed.", show_alert=True)
 
 @bot.on_callback_query(filters.regex("^refresh_progress$"))
 async def refresh_progress_callback(_, query):
@@ -733,11 +930,15 @@ async def refresh_progress_callback(_, query):
 
 
 @bot.on_message(filters.command("killall") & filters.private)
-async def cancel_all_tasks(_, message: Message):
+async def cancel_all_tasks(_, message):
     cancelled = 0
-    if message.from_user.id in BATCH_STATES:
-        del BATCH_STATES[message.from_user.id]
-        
+    user_id = message.from_user.id
+    if user_id in BATCH_STATES:
+        del BATCH_STATES[user_id]
+
+    # Release a pending pin prompt, otherwise the batch waiting on it hangs forever.
+    await release_pending_prompt(user_id, "🛑 Pin prompt cancelled (/killall).")
+
     for task in list(RUNNING_TASKS):
         if not task.done():
             task.cancel()

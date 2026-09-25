@@ -25,3 +25,7 @@ class PyroConf(object):
     MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
     BATCH_SIZE = int(getenv("BATCH_SIZE", "10"))
     FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "3"))
+
+    # Seconds the bot waits for the "pin the first post?" answer of a /batch run
+    # before it continues without pinning.
+    PIN_PROMPT_TIMEOUT = int(getenv("PIN_PROMPT_TIMEOUT", "60"))
