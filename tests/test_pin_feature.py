@@ -149,6 +149,7 @@ class FakeClient(object):
         self.unpins = []
         self.pin_error = None
         self.copied = []
+        self.created = []
         self.gate = None
         self.fetch_error = None
 
@@ -179,14 +180,18 @@ class FakeClient(object):
     async def copy_message(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.gate is not None:
             await self.gate.wait()
+        created_id = 9000 + message_id
         self.copied.append((chat_id, from_chat_id, message_id))
-        return CopyResult(9000 + message_id)
+        self.created.append(created_id)
+        return CopyResult(created_id)
 
     async def copy_media_group(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.gate is not None:
             await self.gate.wait()
+        created_id = 9000 + message_id
         self.copied.append((chat_id, from_chat_id, message_id))
-        return [CopyResult(9000 + message_id)]
+        self.created.append(created_id)
+        return [CopyResult(created_id)]
 
     async def pin_chat_message(self, chat_id, message_id, disable_notification=False, **kwargs):
         if self.pin_error:
@@ -246,6 +251,7 @@ def reset(bot, user_client):
     bot.pin_error = None
     bot.copied = []
     user_client.copied = []
+    user_client.created = []
     user_client.gate = None
     user_client.fetch_error = None
 
@@ -470,8 +476,11 @@ async def test_pin_targets_bot_chat_message():
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
         assert bot.pins == [(USER_ID, 9100)], bot.pins
-        delivered_ids = [mid for _t, _f, mid in user_client.copied]
-        assert 9100 in delivered_ids, "pinned id is not the one delivered to the bot chat"
+        assert user_client.created, "nothing was delivered"
+        assert bot.pins[0][1] == user_client.created[0], (
+            "pinned id %s is not the id the bot chat received (%s)"
+            % (bot.pins[0][1], user_client.created[0])
+        )
     finally:
         await drain_tasks()
 

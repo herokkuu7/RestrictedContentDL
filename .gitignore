@@ -1,9 +1,5 @@
-*__pycache__*
-*.session*
-*.vscode*
-# *.env
-*.log
-*.json
-*.html
-./*.py
-test.py
+logs.txt
+__pycache__/
+*.pyc
+Assets/
+downloads/
