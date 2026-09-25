@@ -493,7 +493,7 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
         for path in temp_paths + invalid_paths:
             cleanup_download(path)
 
-        return sent_group[0].id if sent_group else None
+        return sent_group[0] if sent_group else None
 
     await progress_message.delete()
     for path in invalid_paths:

@@ -124,14 +124,28 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
     if decision.get("pinning"):
         return False
 
-    msg_id = decision.get("first_msg_id")
+    msg_id = getattr(decision.get("first_msg"), "id", None) or decision.get("first_msg_id")
     chat_id = decision.get("chat_id")
     bot_client = decision.get("bot")
     if not msg_id or chat_id is None or bot_client is None:
         return False
 
+    LOGGER(__name__).info(f"Pinning first batch post: chat={chat_id} message={msg_id}")
     decision["pinning"] = True
     try:
+        # Either client may have made the copy and their chat ids differ in a private
+        # chat, so confirm the id really lives in the chat we are about to pin in.
+        # Otherwise Telegram answers 400 MESSAGE_ID_INVALID.
+        try:
+            existing = await bot_client.get_messages(chat_id=chat_id, message_ids=msg_id)
+        except Exception as lookup_error:
+            LOGGER(__name__).info(f"Pre-pin lookup {msg_id} in {chat_id} failed: {lookup_error}")
+            existing = None
+        if existing is None or getattr(existing, "empty", False):
+            raise Exception(
+                f"[400 MESSAGE_ID_INVALID] message {msg_id} is not in chat {chat_id} - "
+                "the first post of this batch was not delivered there"
+            )
         await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True)
     except Exception as e:
         decision["pinning"] = False
@@ -143,8 +157,10 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
                 await send(
                     "⚠️ **Could not pin the first post of this batch.**\n"
                     f"**Telegram said:** `{e}`\n\n"
-                    "For a channel or group destination the bot must be an **admin** there "
-                    "with the **Pin messages** permission."
+                    "• For a channel/group destination the bot must be an **admin** there with "
+                    "the **Pin messages** permission.\n"
+                    "• If you ever ran `/set <your own user id>`, send `/set none` — that "
+                    "destination means Saved Messages and can never be pinned."
                 )
             except Exception:
                 pass
@@ -201,7 +217,8 @@ async def apply_pin_decision(user_id: int, pin_first: bool, query=None) -> bool:
             event.set()
 
     if (first_decision or changed) and pin_first and decision.get("batch_started") \
-            and decision.get("first_msg_id") and not decision.get("pinned"):
+            and (decision.get("first_msg") or decision.get("first_msg_id")) \
+            and not decision.get("pinned"):
         # Answered late, while the batch is already uploading: pin right away.
         # An explicit tap may retry after an earlier automatic failure.
         decision["pin_failed"] = False
@@ -277,7 +294,16 @@ async def resolve_destination(bot: Client, source_message: Message | None = None
       id would silently land in *Saved Messages* instead of this chat.
     """
     if DESTINATION_CHAT_ID:
-        return DESTINATION_CHAT_ID, DESTINATION_CHAT_ID
+        requester_id = getattr(getattr(source_message, "from_user", None), "id", None)
+        if requester_id is not None and DESTINATION_CHAT_ID == requester_id:
+            # A "destination" that is the requester's own id is Saved Messages for the
+            # user client: copies land outside this chat and can never be pinned.
+            LOGGER(__name__).warning(
+                f"Ignoring /set destination {DESTINATION_CHAT_ID}: it is the requester's own "
+                "user id (= Saved Messages for the user client). Using the bot chat instead."
+            )
+        else:
+            return DESTINATION_CHAT_ID, DESTINATION_CHAT_ID
     if not bot.me:
         await bot.get_me()
     bot_chat_id = source_message.chat.id if source_message else bot.me.id
@@ -508,12 +534,16 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 
             if cloned:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                sent_msg_id = None
+                sent_msg = None
                 if "copied_group" in locals() and copied_group:
-                    sent_msg_id = copied_group[0].id
+                    sent_msg = copied_group[0]
                 elif "copied_msg" in locals() and copied_msg:
-                    sent_msg_id = copied_msg.id
-                return {"status": "success", "sent_msg_id": sent_msg_id}
+                    sent_msg = copied_msg
+                return {
+                    "status": "success",
+                    "sent_msg": sent_msg,
+                    "sent_msg_id": getattr(sent_msg, "id", None),
+                }
 
             # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -529,11 +559,15 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
 
             if chat_message.media_group_id:
-                sent_msg_id = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
-                if not sent_msg_id:
+                sent_msg = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
+                if not sent_msg:
                     if not silent:
                         await reply_temporary(message, "**Could not extract any valid media from the media group.**")
-                return {"status": "success", "sent_msg_id": sent_msg_id}
+                return {
+                    "status": "success",
+                    "sent_msg": sent_msg,
+                    "sent_msg_id": getattr(sent_msg, "id", None),
+                }
 
             elif chat_message.media:
                 start_time = time()
@@ -602,11 +636,15 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 if progress_message:
                     await progress_message.delete()
                     
-                return {"status": "success", "sent_msg_id": sent_msg.id if sent_msg else None}
+                return {
+                    "status": "success",
+                    "sent_msg": sent_msg,
+                    "sent_msg_id": getattr(sent_msg, "id", None),
+                }
 
             elif chat_message.text or chat_message.caption:
                 sent_msg = await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                return {"status": "success", "sent_msg_id": sent_msg.id}
+                return {"status": "success", "sent_msg": sent_msg, "sent_msg_id": sent_msg.id}
             else:
                 if not silent:
                     await reply_temporary(message, "**No media or text found in the post URL.**")
@@ -838,6 +876,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 downloaded += 1
                 if isinstance(result, dict) and result.get("sent_msg_id") and not pin_decision.get("first_msg_id"):
                     pin_decision["first_msg_id"] = result["sent_msg_id"]
+                    pin_decision["first_msg"] = result.get("sent_msg")
             else:
                 failed += 1
 

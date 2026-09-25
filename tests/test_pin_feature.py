@@ -34,8 +34,35 @@ import pyrogram  # noqa: E402
 # ----------------------------------------------------------------------
 USER_ID = 424242
 CHANNEL_ID = -1009999
+BOT_USERNAME = "test_bot"
+BOT_ID = 777000
 OUTGOING = []          # every message the bot sends / edits, for assertions
 REGISTERED = []        # handlers registered through the decorators
+
+# Which chat each id really lives in.  A USER session sending to its OWN id
+# lands in Saved Messages - not in the chat with the bot - which is exactly the
+# trap that produces 400 MESSAGE_ID_INVALID when the pin is attempted.
+CHAT_MESSAGES = {}
+
+
+class PinRefused(Exception):
+    """Stands in for Telegram's 400 MESSAGE_ID_INVALID."""
+
+
+def logical_chat(role, chat_id):
+    if isinstance(chat_id, str):
+        return "botchat" if chat_id == BOT_USERNAME else "str:%s" % chat_id
+    if chat_id == USER_ID:
+        return "botchat" if role == "bot" else "saved"
+    if chat_id == BOT_ID:
+        return "botchat"
+    return "chat:%s" % chat_id
+
+
+def register(role, chat_id, msg_id):
+    key = logical_chat(role, chat_id)
+    CHAT_MESSAGES.setdefault(key, {})[msg_id] = True
+    return key
 
 
 class FakeUser(object):
@@ -48,20 +75,35 @@ class FakeChat(object):
         self.id = cid
 
 
-class OutgoingMessage(object):
-    """A message the bot sent: supports the .edit()/.delete() API used."""
+class EmptyMessage(object):
+    """Telegram returns an empty message when an id does not exist in a chat."""
 
+    def __init__(self, mid):
+        self.id = mid
+        self.empty = True
+
+
+class SentMessage(object):
+    """A message that now exists in a chat."""
+
+    def __init__(self, msg_id, chat_id):
+        self.id = msg_id
+        self.chat = FakeChat(chat_id)
+
+
+class OutgoingMessage(SentMessage):
     _next_id = 1000
 
-    def __init__(self, text, reply_markup=None, chat_id=USER_ID):
+    def __init__(self, text, reply_markup=None, chat_id=USER_ID, register_it=True):
         OutgoingMessage._next_id += 1
-        self.id = OutgoingMessage._next_id
+        SentMessage.__init__(self, OutgoingMessage._next_id, chat_id)
         self.text = text
         self.reply_markup = reply_markup
-        self.chat = FakeChat(chat_id)
         self.edits = []
         self.deleted = False
         OUTGOING.append(self)
+        if register_it:
+            register("bot", chat_id, self.id)
 
     async def edit(self, text, reply_markup=None, **kwargs):
         self.text = text
@@ -71,6 +113,8 @@ class OutgoingMessage(object):
 
     async def delete(self):
         self.deleted = True
+        for msgs in CHAT_MESSAGES.values():
+            msgs.pop(self.id, None)
         return True
 
     async def reply(self, text, **kwargs):
@@ -102,11 +146,6 @@ class IncomingMessage(object):
 
     async def delete(self):
         return True
-
-
-class CopyResult(object):
-    def __init__(self, mid):
-        self.id = mid
 
 
 class FakeChatMessage(object):
@@ -142,9 +181,10 @@ class FakeClient(object):
 
     def __init__(self, name, **kwargs):
         self.name = name
+        self.role = "bot" if "bot" in name else "user"
         self.kwargs = kwargs
-        self.me = FakeUser(777000)
-        self.me.username = "test_bot"
+        self.me = FakeUser(BOT_ID if self.role == "bot" else USER_ID)
+        self.me.username = BOT_USERNAME if self.role == "bot" else "tester"
         self.pins = []
         self.unpins = []
         self.pin_error = None
@@ -152,6 +192,7 @@ class FakeClient(object):
         self.created = []
         self.gate = None
         self.fetch_error = None
+        self._sent = 0
 
     # handler registration ------------------------------------------------
     def _record(self, kind):
@@ -167,44 +208,75 @@ class FakeClient(object):
         return self._record("callback_query")
 
     # pyrogram API used by the bot ---------------------------------------
+    def _deliver(self, chat_id, source_id=None):
+        self._sent += 1
+        new_id = (9000 + source_id) if source_id is not None else (7000 + self._sent)
+        register(self.role, chat_id, new_id)
+        self.created.append(new_id)
+        return SentMessage(new_id, chat_id)
+
     async def get_me(self):
         return self.me
 
     async def get_messages(self, chat_id, message_ids):
         if self.fetch_error:
             raise self.fetch_error
-        if isinstance(message_ids, (list, tuple)):
-            return [FakeChatMessage(mid) for mid in message_ids]
-        return FakeChatMessage(message_ids)
+        single = not isinstance(message_ids, (list, tuple))
+        ids = [message_ids] if single else list(message_ids)
+        known = CHAT_MESSAGES.get(logical_chat("bot", chat_id), {}) if self.role == "bot" else None
+        out = []
+        for mid in ids:
+            if known is not None and mid not in known:
+                out.append(EmptyMessage(mid))
+            else:
+                out.append(FakeChatMessage(mid))
+        return out[0] if single else out
 
     async def copy_message(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.gate is not None:
             await self.gate.wait()
-        created_id = 9000 + message_id
         self.copied.append((chat_id, from_chat_id, message_id))
-        self.created.append(created_id)
-        return CopyResult(created_id)
+        return self._deliver(chat_id, source_id=message_id)
 
     async def copy_media_group(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.gate is not None:
             await self.gate.wait()
-        created_id = 9000 + message_id
         self.copied.append((chat_id, from_chat_id, message_id))
-        self.created.append(created_id)
-        return [CopyResult(created_id)]
+        return [self._deliver(chat_id, source_id=message_id)]
+
+    async def send_message(self, chat_id, text, **kwargs):
+        return self._deliver(chat_id)
+
+    async def send_photo(self, chat_id, *a, **kwargs):
+        return self._deliver(chat_id)
+
+    async def send_video(self, chat_id, *a, **kwargs):
+        return self._deliver(chat_id)
+
+    async def send_audio(self, chat_id, *a, **kwargs):
+        return self._deliver(chat_id)
+
+    async def send_document(self, chat_id, *a, **kwargs):
+        return self._deliver(chat_id)
+
+    async def send_media_group(self, chat_id, media, **kwargs):
+        return [self._deliver(chat_id) for _ in media]
 
     async def pin_chat_message(self, chat_id, message_id, disable_notification=False, **kwargs):
         if self.pin_error:
             raise self.pin_error
+        key = logical_chat("bot", chat_id)
+        if message_id not in CHAT_MESSAGES.get(key, {}):
+            raise PinRefused(
+                "[400 MESSAGE_ID_INVALID] message %s does not exist in this chat (%s)"
+                % (message_id, key)
+            )
         self.pins.append((chat_id, message_id))
         return OutgoingMessage("pinned")
 
     async def unpin_chat_message(self, chat_id, message_id=None, **kwargs):
         self.unpins.append((chat_id, message_id))
         return True
-
-    async def send_message(self, chat_id, text, **kwargs):
-        return OutgoingMessage(text, chat_id=chat_id)
 
 
 # Install the fake *before* main.py imports `Client`.
@@ -246,6 +318,7 @@ def reset(bot, user_client):
     main.PIN_PROMPTS.clear()
     main.DESTINATION_CHAT_ID = None
     del OUTGOING[:]
+    CHAT_MESSAGES.clear()
     bot.pins = []
     bot.unpins = []
     bot.pin_error = None
@@ -541,6 +614,51 @@ async def test_pin_failure_reported_only_once():
         await drain_tasks()
 
 
+async def test_stale_self_destination_never_pins_into_the_void():
+    """A destination equal to the user's own id is Saved Messages - must not be used.
+
+    This is the live failure: the user client hands its copy to Saved Messages,
+    so the first delivered id does not exist in the chat being pinned and
+    Telegram answers 400 MESSAGE_ID_INVALID.
+    """
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    main.DESTINATION_CHAT_ID = USER_ID          # stale /set <own user id>
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+
+        assert "saved" not in CHAT_MESSAGES, (
+            "a copy was delivered to Saved Messages: %s" % list(CHAT_MESSAGES)
+        )
+        assert bot.pins, "the first post was not pinned"
+        assert not bot_said("could not pin"), outgoing_texts()
+        assert not bot_said("MESSAGE_ID_INVALID"), outgoing_texts()
+    finally:
+        main.DESTINATION_CHAT_ID = None
+        await drain_tasks()
+
+
+async def test_pinned_id_exists_in_pin_chat():
+    """The pinned id must be a message that really lives in the pinned chat."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert bot.pins, "nothing was pinned"
+        pin_chat, pin_id = bot.pins[0]
+        key = logical_chat("bot", pin_chat)
+        assert pin_id in CHAT_MESSAGES.get(key, {}), (
+            "pinned %s but that id is not in %s (has %s)"
+            % (pin_id, key, sorted(CHAT_MESSAGES.get(key, {})))
+        )
+    finally:
+        await drain_tasks()
+
+
 TESTS = [
     test_prompt_appears_and_blocks_batch,
     test_yes_pins_first_post_once,
@@ -553,6 +671,8 @@ TESTS = [
     test_new_batch_cancels_pending_prompt,
     test_pin_failure_is_reported_to_user,
     test_pin_failure_reported_only_once,
+    test_stale_self_destination_never_pins_into_the_void,
+    test_pinned_id_exists_in_pin_chat,
     test_prompt_closed_after_batch,
     test_no_channel_delivers_to_bot_chat,
     test_pin_targets_bot_chat_message,
