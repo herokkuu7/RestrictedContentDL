@@ -525,6 +525,22 @@ async def test_batch_read_failure_is_reported_then_cleaned():
         await drain_tasks()
 
 
+async def test_pin_failure_reported_only_once():
+    """A failed pin is reported once, not again at every chunk boundary."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    bot.pin_error = Exception("MESSAGE_ID_INVALID")
+    runner = await start_prompt(bot, user_client, count=4, start_id=100)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        warnings = [m for m in OUTGOING if "could not pin" in (m.text or "").lower()]
+        assert len(warnings) == 1, "pin failure reported %d time(s)" % len(warnings)
+        assert bot.pins == [], "a failed pin must not look like success"
+    finally:
+        await drain_tasks()
+
+
 TESTS = [
     test_prompt_appears_and_blocks_batch,
     test_yes_pins_first_post_once,
@@ -536,6 +552,7 @@ TESTS = [
     test_killall_does_not_hang_pending_batch,
     test_new_batch_cancels_pending_prompt,
     test_pin_failure_is_reported_to_user,
+    test_pin_failure_reported_only_once,
     test_prompt_closed_after_batch,
     test_no_channel_delivers_to_bot_chat,
     test_pin_targets_bot_chat_message,

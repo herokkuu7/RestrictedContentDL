@@ -135,6 +135,7 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
         await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True)
     except Exception as e:
         decision["pinning"] = False
+        decision["pin_failed"] = True
         LOGGER(__name__).warning(f"Could not pin message {msg_id} in chat {chat_id}: {e}")
         send = error_notify or notify
         if send:
@@ -202,6 +203,8 @@ async def apply_pin_decision(user_id: int, pin_first: bool, query=None) -> bool:
     if (first_decision or changed) and pin_first and decision.get("batch_started") \
             and decision.get("first_msg_id") and not decision.get("pinned"):
         # Answered late, while the batch is already uploading: pin right away.
+        # An explicit tap may retry after an earlier automatic failure.
+        decision["pin_failed"] = False
         await pin_first_post(decision, notify=prompt.get("notify"), error_notify=prompt.get("error_notify"))
     elif (first_decision or changed) and not pin_first and decision.get("pinned"):
         await unpin_first_post(decision, notify=prompt.get("notify"))
@@ -838,7 +841,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             else:
                 failed += 1
 
-        if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
+        if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
+                and not pin_decision.get("pin_failed"):
             await pin_first_post(pin_decision, notify=message.reply,
                                  error_notify=lambda text: reply_temporary(message, text))
 
@@ -917,7 +921,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
 
     # A "Yes" that arrived late (after the auto-continue) is still honoured here.
-    if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
+    if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
+            and not pin_decision.get("pin_failed"):
         await pin_first_post(pin_decision, notify=message.reply,
                              error_notify=lambda text: reply_temporary(message, text))
 
