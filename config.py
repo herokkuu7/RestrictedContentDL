@@ -29,3 +29,6 @@ class PyroConf(object):
     # Seconds the bot waits for the "pin the first post?" answer of a /batch run
     # before it continues without pinning.
     PIN_PROMPT_TIMEOUT = int(getenv("PIN_PROMPT_TIMEOUT", "60"))
+
+    # How long an error message stays visible before the bot deletes it again.
+    ERROR_MESSAGE_TTL = int(getenv("ERROR_MESSAGE_TTL", "300"))

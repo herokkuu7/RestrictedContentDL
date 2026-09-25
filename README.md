@@ -20,6 +20,8 @@
 - 🔄 Progress bar showing real-time downloading progress.
 - ✍️ Copy text messages or captions from Telegram posts.
 - 📌 Batch mode asks whether to pin the first post of the batch (tap a button or reply `yes` / `no`).
+- 🗂️ With no destination channel set, everything (text, photos, videos, files) is delivered to the bot chat itself.
+- 🧹 Error messages delete themselves automatically after 5 minutes.
 
 ## Requirements
 

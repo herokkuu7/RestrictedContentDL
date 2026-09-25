@@ -1,0 +1,54 @@
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - pin_first_post() - Line 154: main - Pinned first post of batch: chat=424242 message=9100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/102
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/102
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/103
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/103
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:31 AM - INFO] - pin_first_post() - Line 154: main - Pinned first post of batch: chat=-1009999 message=9100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - pin_first_post() - Line 154: main - Pinned first post of batch: chat=424242 message=9100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - pin_first_post() - Line 154: main - Pinned first post of batch: chat=424242 message=9100
+[25-Sep-26 07:03:32 AM - INFO] - handle_text_and_states() - Line 763: main - Pin prompt for 424242 was closed before the batch started.
+[25-Sep-26 07:03:32 AM - INFO] - handle_text_and_states() - Line 763: main - Pin prompt for 424242 was closed before the batch started.
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - WARNING] - pin_first_post() - Line 138: main - Could not pin message 9100 in chat 424242: CHAT_ADMIN_REQUIRED
+[25-Sep-26 07:03:32 AM - WARNING] - pin_first_post() - Line 138: main - Could not pin message 9100 in chat 424242: CHAT_ADMIN_REQUIRED
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/100
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 454: main - Processing URL: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - handle_download() - Line 464: main - Directly cloned via User: https://t.me/testchan/101
+[25-Sep-26 07:03:32 AM - INFO] - pin_first_post() - Line 154: main - Pinned first post of batch: chat=424242 message=9100
+[25-Sep-26 07:03:33 AM - ERROR] - execute_batch_logic() - Line 866: main - CHANNEL_INVALID

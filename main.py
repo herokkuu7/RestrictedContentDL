@@ -117,7 +117,7 @@ def parse_pin_answer(text: str):
     return None
 
 
-async def pin_first_post(decision: dict, notify=None) -> bool:
+async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool:
     """Pin the first uploaded post of the batch (at most once)."""
     if decision.get("pinned"):
         return True
@@ -136,9 +136,10 @@ async def pin_first_post(decision: dict, notify=None) -> bool:
     except Exception as e:
         decision["pinning"] = False
         LOGGER(__name__).warning(f"Could not pin message {msg_id} in chat {chat_id}: {e}")
-        if notify:
+        send = error_notify or notify
+        if send:
             try:
-                await notify(
+                await send(
                     "⚠️ **Could not pin the first post of this batch.**\n"
                     f"**Telegram said:** `{e}`\n\n"
                     "For a channel or group destination the bot must be an **admin** there "
@@ -201,7 +202,7 @@ async def apply_pin_decision(user_id: int, pin_first: bool, query=None) -> bool:
     if (first_decision or changed) and pin_first and decision.get("batch_started") \
             and decision.get("first_msg_id") and not decision.get("pinned"):
         # Answered late, while the batch is already uploading: pin right away.
-        await pin_first_post(decision, notify=prompt.get("notify"))
+        await pin_first_post(decision, notify=prompt.get("notify"), error_notify=prompt.get("error_notify"))
     elif (first_decision or changed) and not pin_first and decision.get("pinned"):
         await unpin_first_post(decision, notify=prompt.get("notify"))
 
@@ -263,14 +264,34 @@ async def pin_prompt_countdown(user_id: int):
 DESTINATION_CHAT_ID = None
 
 
-async def resolve_target_chat_id(bot: Client, source_message: Message | None = None):
+async def resolve_destination(bot: Client, source_message: Message | None = None):
+    """Where a job's output goes, resolved per client -> (bot_chat_id, user_chat_id).
+
+    * A channel set with /set: both clients upload there.
+    * No channel set: the private chat between the user and this bot.
+      The bot client addresses it with the user id, but the USER client must
+      address it with the BOT (id/username) - a user session sending to its own
+      id would silently land in *Saved Messages* instead of this chat.
+    """
     if DESTINATION_CHAT_ID:
-        return DESTINATION_CHAT_ID
-    if source_message:
-        return source_message.chat.id
+        return DESTINATION_CHAT_ID, DESTINATION_CHAT_ID
     if not bot.me:
         await bot.get_me()
-    return bot.me.id
+    bot_chat_id = source_message.chat.id if source_message else bot.me.id
+    user_chat_id = bot.me.username or bot.me.id
+    return bot_chat_id, user_chat_id
+
+
+async def resolve_target_chat_id(bot: Client, source_message: Message | None = None):
+    """Id the BOT client uploads to (and the chat we pin in)."""
+    bot_chat_id, _ = await resolve_destination(bot, source_message)
+    return bot_chat_id
+
+
+async def resolve_user_target_chat_id(bot: Client, source_message: Message | None = None):
+    """Id the USER client uploads to (the bot chat when no channel is set)."""
+    _, user_chat_id = await resolve_destination(bot, source_message)
+    return user_chat_id
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -279,6 +300,27 @@ def track_task(coro):
         RUNNING_TASKS.discard(task)
     task.add_done_callback(_remove)
     return task
+
+
+async def delete_later(msg, delay: float):
+    try:
+        await asyncio.sleep(delay)
+        await msg.delete()
+    except Exception:
+        pass
+
+
+def schedule_delete(msg, delay: float = None):
+    """Self-destruct a temporary (error) message after ERROR_MESSAGE_TTL."""
+    if msg is None:
+        return None
+    track_task(delete_later(msg, PyroConf.ERROR_MESSAGE_TTL if delay is None else delay))
+    return msg
+
+
+async def reply_temporary(message, text, delay: float = None):
+    """Show an error now, remove it again after ERROR_MESSAGE_TTL."""
+    return schedule_delete(await message.reply(text), delay)
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -325,7 +367,11 @@ async def help_command(_, message: Message):
         "➤ **Management**\n"
         "   – `/killall` : Cancel all running tasks.\n"
         "   – `/logs` : Get log file.\n"
-        "   – `/stats` : System status.\n"
+        "   – `/stats` : System status.\n\n"
+        "➤ **Notes**\n"
+        "   – With no destination set, **everything** (text, photos, videos, files) is\n"
+        "     delivered to **this bot chat** — never to Saved Messages.\n"
+        f"   – Error messages delete themselves after {PyroConf.ERROR_MESSAGE_TTL // 60} min.\n"
     )
     
     markup = InlineKeyboardMarkup(
@@ -339,7 +385,7 @@ async def set_destination(bot: Client, message: Message):
     global DESTINATION_CHAT_ID
     
     if len(message.command) < 2:
-        await message.reply(
+        await reply_temporary(message,
             "❌ **Usage:** `/set <channel_id>`\n"
             "Example: `/set -100123456789`\n"
             "To reset: `/set none`"
@@ -363,7 +409,7 @@ async def set_destination(bot: Client, message: Message):
         try:
             sent_msg = await bot.send_message(target_id, "✅ **Destination Channel Connected Successfully!**")
         except Exception as e:
-            await message.reply(
+            await reply_temporary(message,
                 f"❌ **Failed to connect to channel `{target_id}`**.\n\n"
                 f"**Error:** `{e}`\n"
                 "👉 Make sure the Bot is an **Admin** in that channel with post permissions."
@@ -375,7 +421,7 @@ async def set_destination(bot: Client, message: Message):
         LOGGER(__name__).info(f"Destination channel set to {target_id} by user {message.from_user.id}")
 
     except Exception as e:
-        await message.reply(f"❌ **Error:** {str(e)}")
+        await reply_temporary(message, f"❌ **Error:** {str(e)}")
 
 
 # -------------------------------------------------------------------------------------
@@ -394,6 +440,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             post_url = post_url.split("?", 1)[0]
 
         target_chat_id = await resolve_target_chat_id(bot, message)
+        user_target_chat_id = await resolve_user_target_chat_id(bot, message)
         progress_message = None
 
         try:
@@ -410,9 +457,9 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             # --- CLONE ATTEMPTS ---
             try:
                 if chat_message.media_group_id:
-                    copied_group = await user.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_group = await user.copy_media_group(chat_id=user_target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 else:
-                    copied_msg = await user.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
+                    copied_msg = await user.copy_message(chat_id=user_target_chat_id, from_chat_id=chat_id, message_id=message_id)
                 cloned = True
                 LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
             except FloodWait as e:
@@ -482,7 +529,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 sent_msg_id = await processMediaGroup(chat_message, bot, message, destination_chat_id=target_chat_id)
                 if not sent_msg_id:
                     if not silent:
-                        await message.reply("**Could not extract any valid media from the media group.**")
+                        await reply_temporary(message, "**Could not extract any valid media from the media group.**")
                 return {"status": "success", "sent_msg_id": sent_msg_id}
 
             elif chat_message.media:
@@ -516,12 +563,20 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     )
 
                 if not media_path or not os.path.exists(media_path):
-                    if progress_message: await progress_message.edit("**❌ Download failed: File not saved properly**")
+                    if progress_message:
+                        await progress_message.edit("**❌ Download failed: File not saved properly**")
+                        schedule_delete(progress_message)
+                    else:
+                        await reply_temporary(message, "**❌ Download failed: File not saved properly**")
                     return "error"
 
                 file_size = os.path.getsize(media_path)
                 if file_size == 0:
-                    if progress_message: await progress_message.edit("**❌ Download failed: File is empty**")
+                    if progress_message:
+                        await progress_message.edit("**❌ Download failed: File is empty**")
+                        schedule_delete(progress_message)
+                    else:
+                        await reply_temporary(message, "**❌ Download failed: File is empty**")
                     cleanup_download(media_path)
                     return "error"
 
@@ -551,14 +606,14 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 return {"status": "success", "sent_msg_id": sent_msg.id}
             else:
                 if not silent:
-                    await message.reply("**No media or text found in the post URL.**")
+                    await reply_temporary(message, "**No media or text found in the post URL.**")
                 return "error"
 
         # --- GLOBAL ERROR HANDLING & ABORT LOGIC ---
         except FloodWait as e:
             if abort_event and not abort_event.is_set():
                 abort_event.set() # Trigger global shut down
-                await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. Process Aborted.")
+                await reply_temporary(message, f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds. Process Aborted.")
             if progress_message:
                 await progress_message.delete()
             return "aborted"
@@ -567,15 +622,18 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             if abort_event and abort_event.is_set(): return "aborted"
             err = f"**Error processing {post_url}: User client likely not in chat.**"
             if not silent:
-                if progress_message: await progress_message.edit(err)
-                else: await message.reply(err)
+                if progress_message:
+                    await progress_message.edit(err)
+                    schedule_delete(progress_message)
+                else:
+                    await reply_temporary(message, err)
             return "error"
             
         except Exception as e:
             if "FLOOD_WAIT" in str(e).upper():
                 if abort_event and not abort_event.is_set():
                     abort_event.set()
-                    await message.reply(f"🚨 **FloodWait Triggered!**\nProcess Aborted.")
+                    await reply_temporary(message, f"🚨 **FloodWait Triggered!**\nProcess Aborted.")
                 if progress_message:
                     await progress_message.delete()
                 return "aborted"
@@ -584,8 +642,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
             
             error_message = f"**❌ Error at {post_url}: {str(e)}**"
             if not silent:
-                if progress_message: await progress_message.edit(error_message)
-                else: await message.reply(error_message)
+                if progress_message:
+                    await progress_message.edit(error_message)
+                    schedule_delete(progress_message)
+                else:
+                    await reply_temporary(message, error_message)
             LOGGER(__name__).error(e)
             return "error"
 
@@ -593,17 +654,17 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media_cmd(bot: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply("**Provide a post URL after the /dl command.**")
+        await reply_temporary(message, "**Provide a post URL after the /dl command.**")
         return
     post_url = message.command[1]
     
     try:
         await track_task(handle_download(bot, message, post_url, silent=False))
     except FloodWait as e:
-        await message.reply(f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds.")
+        await reply_temporary(message, f"🚨 **FloodWait Triggered!**\nTelegram requires a wait of `{e.value}` seconds.")
     except Exception as e:
         if "FLOOD_WAIT" in str(e).upper():
-             await message.reply(f"🚨 **FloodWait Triggered!**")
+             await reply_temporary(message, f"🚨 **FloodWait Triggered!**")
 
 
 # -------------------------------------------------------------------------------------
@@ -632,7 +693,7 @@ async def handle_text_and_states(bot: Client, message: Message):
     if state:
         if state['step'] == 'ask_link':
             if not message.text.startswith("https://t.me/"):
-                await message.reply("❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
+                await reply_temporary(message, "❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
                 return
 
             BATCH_STATES[user_id]['start_link'] = message.text
@@ -646,7 +707,7 @@ async def handle_text_and_states(bot: Client, message: Message):
 
         elif state['step'] == 'ask_count':
             if not message.text.isdigit():
-                await message.reply("❌ Please send a valid number.")
+                await reply_temporary(message, "❌ Please send a valid number.")
                 return
 
             count = int(message.text)
@@ -668,6 +729,7 @@ async def handle_text_and_states(bot: Client, message: Message):
                 "prompt_msg": prompt_msg,
                 "markup": markup,
                 "notify": message.reply,
+                "error_notify": lambda text: reply_temporary(message, text),
                 "decided": False,
                 "cancelled": False,
                 "current_choice": None,
@@ -739,7 +801,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     try:
         start_chat, start_id, start_thread_id = getChatMsgID(start_link)
     except Exception as e:
-        return await message.reply(f"**❌ Error parsing start link:\n{e}**")
+        return await reply_temporary(message, f"**❌ Error parsing start link:\n{e}**")
 
     end_id = start_id + count - 1
     prefix = start_link.rsplit("/", 1)[0]
@@ -777,7 +839,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 failed += 1
 
         if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
-            await pin_first_post(pin_decision, notify=message.reply)
+            await pin_first_post(pin_decision, notify=message.reply,
+                                 error_notify=lambda text: reply_temporary(message, text))
 
     all_message_ids = list(range(start_id, end_id + 1))
     chunk_size = 50 # Fetch 50 messages per API call (Instant skipping)
@@ -792,15 +855,17 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             # OPTIMIZATION: Fetch in bulk to save API rate limits!
             messages_batch = await user.get_messages(chat_id=start_chat, message_ids=chunk)
         except FloodWait as e:
-            await message.reply(f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
+            await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**\nWait `{e.value}` seconds.")
             abort_event.set()
             break
         except Exception as e:
             if "FLOOD_WAIT" in str(e).upper():
-                 await message.reply(f"🚨 **Batch Halted: Read FloodWait Triggered!**")
+                 await reply_temporary(message, f"🚨 **Batch Halted: Read FloodWait Triggered!**")
                  abort_event.set()
                  break
+            LOGGER(__name__).error(e)
             failed += len(chunk)
+            await reply_temporary(message, f"**⚠️ Could not read {len(chunk)} message(s): {e}**")
             continue
 
         if getattr(messages_batch, "id", None) is not None:
@@ -853,7 +918,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
     # A "Yes" that arrived late (after the auto-continue) is still honoured here.
     if pin_decision.get("pin_first") and not pin_decision.get("pinned"):
-        await pin_first_post(pin_decision, notify=message.reply)
+        await pin_first_post(pin_decision, notify=message.reply,
+                             error_notify=lambda text: reply_temporary(message, text))
 
     if pin_prompt is not None:
         await release_pending_prompt(

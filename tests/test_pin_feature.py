@@ -443,6 +443,79 @@ async def test_prompt_closed_after_batch():
         await drain_tasks()
 
 
+async def test_no_channel_delivers_to_bot_chat():
+    """With no /set channel, content must land in the bot chat, never Saved Messages."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert user_client.copied, "nothing was copied"
+        for target, _from_chat, _mid in user_client.copied:
+            assert target != USER_ID, (
+                "user client uploaded to its own id (= Saved Messages) instead of the bot chat"
+            )
+            assert target in ("test_bot", bot.me.id), target
+    finally:
+        await drain_tasks()
+
+
+async def test_pin_targets_bot_chat_message():
+    """The pin addresses the chat the first post was delivered to, using its id there."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert bot.pins == [(USER_ID, 9100)], bot.pins
+        delivered_ids = [mid for _t, _f, mid in user_client.copied]
+        assert 9100 in delivered_ids, "pinned id is not the one delivered to the bot chat"
+    finally:
+        await drain_tasks()
+
+
+async def test_error_messages_are_deleted_after_ttl():
+    """Error replies are shown first, then removed automatically."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    original = main.PyroConf.ERROR_MESSAGE_TTL
+    main.PyroConf.ERROR_MESSAGE_TTL = 0.2
+    try:
+        await main.batch_command_start(bot, IncomingMessage("/batch"))
+        await main.handle_text_and_states(bot, IncomingMessage("not-a-link"))
+        err = OUTGOING[-1]
+        assert "invalid link" in (err.text or "").lower(), err.text
+        assert not err.deleted, "error vanished before the user could read it"
+        await asyncio.sleep(0.6)
+        assert err.deleted, "error message was not deleted after ERROR_MESSAGE_TTL"
+    finally:
+        main.PyroConf.ERROR_MESSAGE_TTL = original
+        await drain_tasks()
+
+
+async def test_batch_read_failure_is_reported_then_cleaned():
+    """A chunk that cannot be read is reported, and that report self-destructs."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    original = main.PyroConf.ERROR_MESSAGE_TTL
+    main.PyroConf.ERROR_MESSAGE_TTL = 0.2
+    user_client.fetch_error = Exception("CHANNEL_INVALID")
+    try:
+        runner = await start_prompt(bot, user_client)
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        errors = [m for m in OUTGOING if "could not read" in (m.text or "").lower()]
+        assert errors, "the read failure was not reported to the user"
+        await asyncio.sleep(0.6)
+        assert any(m.deleted for m in errors), "error report was not cleaned up"
+    finally:
+        main.PyroConf.ERROR_MESSAGE_TTL = original
+        user_client.fetch_error = None
+        await drain_tasks()
+
+
 TESTS = [
     test_prompt_appears_and_blocks_batch,
     test_yes_pins_first_post_once,
@@ -455,6 +528,10 @@ TESTS = [
     test_new_batch_cancels_pending_prompt,
     test_pin_failure_is_reported_to_user,
     test_prompt_closed_after_batch,
+    test_no_channel_delivers_to_bot_chat,
+    test_pin_targets_bot_chat_message,
+    test_error_messages_are_deleted_after_ttl,
+    test_batch_read_failure_is_reported_then_cleaned,
 ]
 
 
