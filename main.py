@@ -322,6 +322,66 @@ async def resolve_user_target_chat_id(bot: Client, source_message: Message | Non
     _, user_chat_id = await resolve_destination(bot, source_message)
     return user_chat_id
 
+async def try_clone(bot: Client, chat_message, chat_id, message_id,
+                    target_chat_id, user_target_chat_id):
+    """COPY the post instead of downloading and uploading it.
+
+    A copy keeps Telegram's own file, so nothing is transferred.  Strategies are
+    ordered cheapest-and-most-likely first, and every failure reason is collected
+    so the caller can tell the user why a download was necessary.
+    """
+    errors = []
+    is_group = bool(chat_message.media_group_id)
+
+    plan = [("user", user, user_target_chat_id)]
+    if target_chat_id != user_target_chat_id:
+        plan.append(("bot", bot, target_chat_id))
+        plan.append(("relay", None, None))      # user -> bot chat -> destination
+
+    for name, client, dest in plan:
+        try:
+            if name == "relay":
+                if not bot.me:
+                    await bot.get_me()
+                if is_group:
+                    relayed = await user.copy_media_group(
+                        chat_id=bot.me.id, from_chat_id=chat_id, message_id=message_id)
+                    if not relayed:
+                        errors.append("relay: nothing copied into the bot chat")
+                        continue
+                    copied = await bot.copy_media_group(
+                        chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed[0].id)
+                    sent = copied[0] if isinstance(copied, list) and copied else None
+                else:
+                    relayed = await user.copy_message(
+                        chat_id=bot.me.id, from_chat_id=chat_id, message_id=message_id)
+                    sent = await bot.copy_message(
+                        chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed.id)
+                    try:
+                        await relayed.delete()
+                    except Exception:
+                        pass
+            elif is_group:
+                copied = await client.copy_media_group(
+                    chat_id=dest, from_chat_id=chat_id, message_id=message_id)
+                sent = copied[0] if isinstance(copied, list) and copied else None
+            else:
+                sent = await client.copy_message(
+                    chat_id=dest, from_chat_id=chat_id, message_id=message_id)
+
+            if sent:
+                LOGGER(__name__).info(f"Cloned message {message_id} via {name}")
+                return sent, name, errors
+            errors.append(f"{name}: empty result")
+        except FloodWait:
+            raise
+        except Exception as e:
+            LOGGER(__name__).info(f"{name} clone failed for {message_id}: {e}")
+            errors.append(f"{name}: {e}")
+
+    return None, None, errors
+
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -481,69 +541,19 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
-            cloned = False
-            
-            # --- CLONE ATTEMPTS ---
-            try:
-                if chat_message.media_group_id:
-                    copied_group = await user.copy_media_group(chat_id=user_target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                else:
-                    copied_msg = await user.copy_message(chat_id=user_target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                cloned = True
-                LOGGER(__name__).info(f"Directly cloned via User: {post_url}")
-            except FloodWait as e:
-                raise e # DO NOT MASK FLOODWAIT!
-            except Exception as e_user:
-                LOGGER(__name__).info(f"User direct clone failed: {e_user}")
-
-                try:
-                    if chat_message.media_group_id:
-                        copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                    else:
-                        copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=chat_id, message_id=message_id)
-                    cloned = True
-                    LOGGER(__name__).info(f"Directly cloned via Bot: {post_url}")
-                except FloodWait as e:
-                    raise e
-                except Exception as e_bot:
-                    LOGGER(__name__).info(f"Bot direct clone failed: {e_bot}")
-
-                    try:
-                        if not bot.me:
-                            await bot.get_me()
-                        bot_username = bot.me.username
-                        
-                        if chat_message.media_group_id:
-                            relayed_msgs = await user.copy_media_group(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
-                            if relayed_msgs:
-                                copied_group = await bot.copy_media_group(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msgs[0].id)
-                        else:
-                            relayed_msg = await user.copy_message(chat_id=bot_username, from_chat_id=chat_id, message_id=message_id)
-                            copied_msg = await bot.copy_message(chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed_msg.id)
-                            try:
-                                await relayed_msg.delete()
-                            except:
-                                pass
-                        cloned = True
-                        LOGGER(__name__).info(f"Relay clone success: {post_url}")
-
-                    except FloodWait as e:
-                        raise e
-                    except Exception as e_relay:
-                        LOGGER(__name__).info(f"Relay clone failed: {e_relay}")
-
-            if cloned:
+            sent_msg, clone_strategy, clone_errors = await try_clone(
+                bot, chat_message, chat_id, message_id,
+                target_chat_id, user_target_chat_id
+            )
+            if sent_msg:
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-                sent_msg = None
-                if "copied_group" in locals() and copied_group:
-                    sent_msg = copied_group[0]
-                elif "copied_msg" in locals() and copied_msg:
-                    sent_msg = copied_msg
                 return {
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "cloned": True,
                 }
+            LOGGER(__name__).info(f"Clone unavailable for {post_url}: {clone_errors}")
 
             # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -567,6 +577,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "clone_errors": clone_errors,
                 }
 
             elif chat_message.media:
@@ -640,11 +651,17 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "clone_errors": clone_errors,
                 }
 
             elif chat_message.text or chat_message.caption:
                 sent_msg = await bot.send_message(target_chat_id, parsed_text or parsed_caption)
-                return {"status": "success", "sent_msg": sent_msg, "sent_msg_id": sent_msg.id}
+                return {
+                    "status": "success",
+                    "sent_msg": sent_msg,
+                    "sent_msg_id": sent_msg.id,
+                    "clone_errors": clone_errors,
+                }
             else:
                 if not silent:
                     await reply_temporary(message, "**No media or text found in the post URL.**")
@@ -860,6 +877,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
     BATCH_SIZE = PyroConf.BATCH_SIZE
 
     abort_event = asyncio.Event() # Shared flag to shut everything down
+    seen_groups = {}              # each album is handled once, not per member id
+    clone_state = {"count": 0, "reason": None, "notified": False}
 
     pin_decision["bot"] = bot
     pin_decision["chat_id"] = await resolve_target_chat_id(bot, message)
@@ -872,6 +891,10 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
             status = result.get("status") if isinstance(result, dict) else result
             if status == "aborted" or abort_event.is_set():
                 continue
+            if isinstance(result, dict) and result.get("clone_errors"):
+                clone_state["count"] += 1
+                if not clone_state["reason"]:
+                    clone_state["reason"] = str(result["clone_errors"][0])
             if status == "success":
                 downloaded += 1
                 if isinstance(result, dict) and result.get("sent_msg_id") and not pin_decision.get("first_msg_id"):
@@ -879,6 +902,13 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                     pin_decision["first_msg"] = result.get("sent_msg")
             else:
                 failed += 1
+
+        if clone_state["count"] and not clone_state["notified"]:
+            clone_state["notified"] = True
+            await reply_temporary(message,
+                f"ℹ️ **Cloning was not possible for {clone_state['count']} item(s)** — "
+                "those were downloaded and re-uploaded instead.\n"
+                f"**Reason:** `{clone_state['reason']}`")
 
         if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
                 and not pin_decision.get("pin_failed"):
@@ -927,6 +957,12 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 if msg_thread != start_thread_id:
                     skipped += 1
                     continue
+
+            if chat_msg.media_group_id:
+                if chat_msg.media_group_id in seen_groups:
+                    skipped += 1        # already handled with its album's first post
+                    continue
+                seen_groups[chat_msg.media_group_id] = chat_msg.id
 
             has_media = bool(chat_msg.media_group_id or chat_msg.media)
             has_text  = bool(chat_msg.text or chat_msg.caption)

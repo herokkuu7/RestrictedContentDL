@@ -12,6 +12,7 @@ Run with:
 """
 
 import asyncio
+import io
 import os
 import sys
 import traceback
@@ -43,6 +44,13 @@ REGISTERED = []        # handlers registered through the decorators
 # lands in Saved Messages - not in the chat with the bot - which is exactly the
 # trap that produces 400 MESSAGE_ID_INVALID when the pin is attempted.
 CHAT_MESSAGES = {}
+
+# id -> media_group_id, so a test can make several ids one album
+GROUP_MEMBERS = {}
+# ids whose media was really downloaded (cloning was not used)
+CHAT_MESSAGE_DOWNLOADS = []
+# switch the fake messages to photos (keeps the upload path cheap)
+MESSAGE_IS_PHOTO = [False]
 
 
 class PinRefused(Exception):
@@ -154,15 +162,33 @@ class FakeChatMessage(object):
     def __init__(self, mid):
         self.id = mid
         self.empty = False
-        self.media = "video"          # truthy -> treated as downloadable
-        self.media_group_id = None
+        if MESSAGE_IS_PHOTO[0]:
+            self.media = "photo"
+            self.photo = "photo"
+        else:
+            self.media = "video"      # truthy -> treated as downloadable
+            self.photo = None
+        self.media_group_id = GROUP_MEMBERS.get(mid)
         self.text = None
         self.caption = None
+        self.caption_entities = None
+        self.entities = None
         self.message_thread_id = None
-        self.photo = None
         self.video = None
         self.audio = None
         self.document = None
+        # these are consulted by get_file_name() on the download path
+        self.voice = None
+        self.video_note = None
+        self.animation = None
+        self.sticker = None
+
+    async def download(self, file_name=None, progress=None, progress_args=None):
+        CHAT_MESSAGE_DOWNLOADS.append(self.id)
+        path = file_name or "/tmp/fake_download.bin"
+        with io.open(path, "wb") as fh:
+            fh.write(b"payload")
+        return path
 
 
 class CallbackQuery(object):
@@ -192,6 +218,7 @@ class FakeClient(object):
         self.created = []
         self.gate = None
         self.fetch_error = None
+        self.copy_error = None
         self._sent = 0
 
     # handler registration ------------------------------------------------
@@ -233,12 +260,16 @@ class FakeClient(object):
         return out[0] if single else out
 
     async def copy_message(self, chat_id, from_chat_id, message_id, **kwargs):
+        if self.copy_error is not None:
+            raise self.copy_error
         if self.gate is not None:
             await self.gate.wait()
         self.copied.append((chat_id, from_chat_id, message_id))
         return self._deliver(chat_id, source_id=message_id)
 
     async def copy_media_group(self, chat_id, from_chat_id, message_id, **kwargs):
+        if self.copy_error is not None:
+            raise self.copy_error
         if self.gate is not None:
             await self.gate.wait()
         self.copied.append((chat_id, from_chat_id, message_id))
@@ -319,9 +350,14 @@ def reset(bot, user_client):
     main.DESTINATION_CHAT_ID = None
     del OUTGOING[:]
     CHAT_MESSAGES.clear()
+    GROUP_MEMBERS.clear()
+    del CHAT_MESSAGE_DOWNLOADS[:]
+    MESSAGE_IS_PHOTO[0] = False
     bot.pins = []
     bot.unpins = []
     bot.pin_error = None
+    bot.copy_error = None
+    user_client.copy_error = None
     bot.copied = []
     user_client.copied = []
     user_client.created = []
@@ -659,6 +695,62 @@ async def test_pinned_id_exists_in_pin_chat():
         await drain_tasks()
 
 
+async def test_clone_is_preferred_over_download():
+    """A copyable post (public channel, forwarding open) is cloned, never downloaded."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    del CHAT_MESSAGE_DOWNLOADS[:]
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert user_client.copied, "the post was not copied"
+        assert CHAT_MESSAGE_DOWNLOADS == [], (
+            "downloaded instead of cloning: %s" % CHAT_MESSAGE_DOWNLOADS
+        )
+        assert not bot_said("cloning was not possible"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_download_fallback_only_when_clone_blocked():
+    """When copying is refused, download+upload is used and the reason is shown."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    del CHAT_MESSAGE_DOWNLOADS[:]
+    MESSAGE_IS_PHOTO[0] = True          # exercise the upload path cheaply
+    refusal = Exception("CHAT_FORWARDS_RESTRICTED")
+    bot.copy_error = refusal
+    user_client.copy_error = refusal
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=15)
+        assert CHAT_MESSAGE_DOWNLOADS, "nothing was downloaded although copying was refused"
+        assert bot_said("cloning was not possible"), outgoing_texts()
+        assert bot_said("CHAT_FORWARDS_RESTRICTED"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_album_members_are_processed_once():
+    """A media group is handled from its first post; the other members are skipped."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    GROUP_MEMBERS[100] = "GROUP-X"
+    GROUP_MEMBERS[101] = "GROUP-X"
+    runner = await start_prompt(bot, user_client, count=2, start_id=100)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert len(user_client.copied) == 1, (
+            "album members were handled %d times (should be once)" % len(user_client.copied)
+        )
+        assert bot_said("**skipped** : `1`"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
 TESTS = [
     test_prompt_appears_and_blocks_batch,
     test_yes_pins_first_post_once,
@@ -678,6 +770,9 @@ TESTS = [
     test_pin_targets_bot_chat_message,
     test_error_messages_are_deleted_after_ttl,
     test_batch_read_failure_is_reported_then_cleaned,
+    test_clone_is_preferred_over_download,
+    test_download_fallback_only_when_clone_blocked,
+    test_album_members_are_processed_once,
 ]
 
 
