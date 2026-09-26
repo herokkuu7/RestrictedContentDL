@@ -78,7 +78,12 @@ def new_pin_decision() -> dict:
         "pin_first": False,
         "bot": None,
         "chat_id": None,
+        "user_chat_id": None,
+        "private": False,
         "first_msg_id": None,
+        "first_msg": None,
+        "first_sender": None,
+        "pinned_in": None,
         "pinned": False,
         "pinning": False,
         "batch_started": False,
@@ -105,6 +110,19 @@ def pin_answer_alert(pin_first: bool) -> str:
     return "Pin enabled for this batch." if pin_first else "No pinning for this batch."
 
 
+def pin_target(decision: dict):
+    """(client, chat_id) that can pin the batch's first post.
+
+    In a private chat every account has its OWN message ids.  A post the user
+    session copied into the bot chat has an id only the user session knows, so
+    it must be pinned by the user session (for both sides).  In a channel the
+    ids are shared and the bot, an admin there, pins.
+    """
+    if decision.get("private") and decision.get("first_sender") == "user":
+        return user, decision.get("user_chat_id")
+    return decision.get("bot"), decision.get("chat_id")
+
+
 def parse_pin_answer(text: str):
     """Return True/False when the text clearly answers the pin prompt, else None."""
     if not text:
@@ -125,8 +143,8 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
         return False
 
     msg_id = getattr(decision.get("first_msg"), "id", None) or decision.get("first_msg_id")
-    chat_id = decision.get("chat_id")
-    bot_client = decision.get("bot")
+    bot_client, chat_id = pin_target(decision)
+    both_sides = bool(decision.get("private"))
     if not msg_id or chat_id is None or bot_client is None:
         return False
 
@@ -146,7 +164,8 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
                 f"[400 MESSAGE_ID_INVALID] message {msg_id} is not in chat {chat_id} - "
                 "the first post of this batch was not delivered there"
             )
-        await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True)
+        await bot_client.pin_chat_message(chat_id, msg_id, disable_notification=True,
+                                          both_sides=both_sides)
     except Exception as e:
         decision["pinning"] = False
         decision["pin_failed"] = True
@@ -158,9 +177,7 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
                     "⚠️ **Could not pin the first post of this batch.**\n"
                     f"**Telegram said:** `{e}`\n\n"
                     "• For a channel/group destination the bot must be an **admin** there with "
-                    "the **Pin messages** permission.\n"
-                    "• If you ever ran `/set <your own user id>`, send `/set none` — that "
-                    "destination means Saved Messages and can never be pinned."
+                    "the **Pin messages** permission."
                 )
             except Exception:
                 pass
@@ -168,6 +185,7 @@ async def pin_first_post(decision: dict, notify=None, error_notify=None) -> bool
 
     decision["pinning"] = False
     decision["pinned"] = True
+    decision["pinned_in"] = (bot_client, chat_id, msg_id)
     LOGGER(__name__).info(f"Pinned first post of batch: chat={chat_id} message={msg_id}")
     if notify:
         try:
@@ -181,8 +199,10 @@ async def unpin_first_post(decision: dict, notify=None) -> bool:
     """Undo the pin when the user changes their mind while the batch is running."""
     if not decision.get("pinned"):
         return False
+    client, chat_id, msg_id = decision.get("pinned_in") or (
+        decision["bot"], decision["chat_id"], decision["first_msg_id"])
     try:
-        await decision["bot"].unpin_chat_message(decision["chat_id"], decision["first_msg_id"])
+        await client.unpin_chat_message(chat_id, msg_id)
     except Exception as e:
         LOGGER(__name__).warning(f"Could not unpin the first batch post: {e}")
         return False
@@ -322,64 +342,89 @@ async def resolve_user_target_chat_id(bot: Client, source_message: Message | Non
     _, user_chat_id = await resolve_destination(bot, source_message)
     return user_chat_id
 
+PROTECTED_REASON = (
+    "content protection is enabled on the source chat - Telegram blocks forwarding "
+    "and copying there, so the file has to be downloaded"
+)
+
+
+async def get_album_ids(chat_id, message_id):
+    """Ids of every post in the album containing message_id (one API call)."""
+    try:
+        group = await user.get_media_group(chat_id, message_id)
+        ids = sorted(m.id for m in group or [] if m and not getattr(m, "empty", False))
+        if ids:
+            return ids
+    except FloodWait:
+        raise
+    except Exception as e:
+        LOGGER(__name__).info(f"Could not read album of {message_id}: {e}")
+    return [message_id]
+
+
 async def try_clone(bot: Client, chat_message, chat_id, message_id,
                     target_chat_id, user_target_chat_id):
-    """COPY the post instead of downloading and uploading it.
+    """Clone a post without downloading it -> (sent_msg, strategy, sender, errors).
 
-    A copy keeps Telegram's own file, so nothing is transferred.  Strategies are
-    ordered cheapest-and-most-likely first, and every failure reason is collected
-    so the caller can tell the user why a download was necessary.
+    Forwarding with drop_author=True is tried first: Telegram copies the post
+    server-side (no author shown, captions and albums intact), with no file
+    transfer and no caption re-parsing.  copy_* is the second choice, then the
+    same two with the bot account.  Every failure reason is kept.
     """
+    if getattr(chat_message, "has_protected_content", False):
+        return None, None, None, [PROTECTED_REASON]
+
     errors = []
     is_group = bool(chat_message.media_group_id)
+    ids = await get_album_ids(chat_id, message_id) if is_group else [message_id]
 
-    plan = [("user", user, user_target_chat_id)]
-    if target_chat_id != user_target_chat_id:
-        plan.append(("bot", bot, target_chat_id))
-        plan.append(("relay", None, None))      # user -> bot chat -> destination
-
-    for name, client, dest in plan:
+    plan = (
+        ("user-forward", "user", user_target_chat_id),
+        ("user-copy", "user", user_target_chat_id),
+        ("bot-forward", "bot", target_chat_id),
+        ("bot-copy", "bot", target_chat_id),
+    )
+    for name, sender, dest in plan:
+        client = user if sender == "user" else bot
         try:
-            if name == "relay":
-                if not bot.me:
-                    await bot.get_me()
-                if is_group:
-                    relayed = await user.copy_media_group(
-                        chat_id=bot.me.id, from_chat_id=chat_id, message_id=message_id)
-                    if not relayed:
-                        errors.append("relay: nothing copied into the bot chat")
-                        continue
-                    copied = await bot.copy_media_group(
-                        chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed[0].id)
-                    sent = copied[0] if isinstance(copied, list) and copied else None
-                else:
-                    relayed = await user.copy_message(
-                        chat_id=bot.me.id, from_chat_id=chat_id, message_id=message_id)
-                    sent = await bot.copy_message(
-                        chat_id=target_chat_id, from_chat_id=bot.me.id, message_id=relayed.id)
-                    try:
-                        await relayed.delete()
-                    except Exception:
-                        pass
+            if name.endswith("forward"):
+                sent = await client.forward_messages(
+                    chat_id=dest, from_chat_id=chat_id, message_ids=ids, drop_author=True)
             elif is_group:
-                copied = await client.copy_media_group(
+                sent = await client.copy_media_group(
                     chat_id=dest, from_chat_id=chat_id, message_id=message_id)
-                sent = copied[0] if isinstance(copied, list) and copied else None
             else:
                 sent = await client.copy_message(
                     chat_id=dest, from_chat_id=chat_id, message_id=message_id)
 
+            if isinstance(sent, list):
+                sent = sent[0] if sent else None
             if sent:
-                LOGGER(__name__).info(f"Cloned message {message_id} via {name}")
-                return sent, name, errors
+                LOGGER(__name__).info(f"Cloned {ids} via {name}")
+                return sent, name, sender, errors
             errors.append(f"{name}: empty result")
         except FloodWait:
             raise
         except Exception as e:
-            LOGGER(__name__).info(f"{name} clone failed for {message_id}: {e}")
+            LOGGER(__name__).info(f"{name} failed for {ids}: {e}")
             errors.append(f"{name}: {e}")
 
-    return None, None, errors
+    return None, None, None, errors
+
+
+async def announce_clone_fallback(message, errors, notice=None):
+    """Say why a post has to be downloaded - BEFORE the download starts."""
+    if notice is not None:
+        if notice.get("sent"):
+            return
+        notice["sent"] = True
+    reason = errors[0] if errors else "unknown"
+    try:
+        await reply_temporary(message,
+            "ℹ️ **Could not clone — downloading and re-uploading instead.**\n"
+            f"**Reason:** `{reason}`")
+    except Exception:
+        pass
 
 
 def track_task(coro):
@@ -399,11 +444,18 @@ async def delete_later(msg, delay: float):
         pass
 
 
+CLEANUP_TASKS = set()      # NOT in RUNNING_TASKS: /killall must not cancel them
+ACTIVE_BATCHES = {}        # user id -> {"abort": Event, "cancelled": bool}
+
+
 def schedule_delete(msg, delay: float = None):
     """Self-destruct a temporary (error) message after ERROR_MESSAGE_TTL."""
     if msg is None:
         return None
-    track_task(delete_later(msg, PyroConf.ERROR_MESSAGE_TTL if delay is None else delay))
+    task = asyncio.create_task(
+        delete_later(msg, PyroConf.ERROR_MESSAGE_TTL if delay is None else delay))
+    CLEANUP_TASKS.add(task)
+    task.add_done_callback(CLEANUP_TASKS.discard)
     return msg
 
 
@@ -516,7 +568,7 @@ async def set_destination(bot: Client, message: Message):
 # -------------------------------------------------------------------------------------
 # CORE DOWNLOAD LOGIC
 # -------------------------------------------------------------------------------------
-async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False, pre_fetched_msg=None, abort_event: asyncio.Event = None):
+async def handle_download(bot: Client, message: Message, post_url: str, silent: bool = False, pre_fetched_msg=None, abort_event: asyncio.Event = None, clone_notice: dict = None):
     # If abort signal is triggered globally, exit instantly.
     if abort_event and abort_event.is_set():
         return "aborted"
@@ -541,7 +593,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                 chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
             
             LOGGER(__name__).info(f"Processing URL: {post_url}")
-            sent_msg, clone_strategy, clone_errors = await try_clone(
+            sent_msg, clone_strategy, clone_sender, clone_errors = await try_clone(
                 bot, chat_message, chat_id, message_id,
                 target_chat_id, user_target_chat_id
             )
@@ -551,9 +603,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, silent: 
                     "status": "success",
                     "sent_msg": sent_msg,
                     "sent_msg_id": getattr(sent_msg, "id", None),
+                    "sent_by": clone_sender,
                     "cloned": True,
                 }
             LOGGER(__name__).info(f"Clone unavailable for {post_url}: {clone_errors}")
+            await announce_clone_fallback(message, clone_errors, clone_notice)
 
             # --- FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -878,37 +932,35 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
 
     abort_event = asyncio.Event() # Shared flag to shut everything down
     seen_groups = {}              # each album is handled once, not per member id
-    clone_state = {"count": 0, "reason": None, "notified": False}
+    clone_notice = {"sent": False}
+    batch_state = {"abort": abort_event, "cancelled": False}
+    ACTIVE_BATCHES[message.from_user.id] = batch_state
+    cancelled = 0
 
     pin_decision["bot"] = bot
     pin_decision["chat_id"] = await resolve_target_chat_id(bot, message)
+    pin_decision["user_chat_id"] = await resolve_user_target_chat_id(bot, message)
+    pin_decision["private"] = pin_decision["user_chat_id"] != pin_decision["chat_id"]
     pin_decision["batch_started"] = True
 
     async def consume_results(results):
         """Tally a finished chunk and pin the first uploaded post exactly once."""
-        nonlocal downloaded, failed
+        nonlocal downloaded, failed, cancelled
         for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                cancelled += 1          # stopped by /killall - not a failure
+                continue
             status = result.get("status") if isinstance(result, dict) else result
             if status == "aborted" or abort_event.is_set():
                 continue
-            if isinstance(result, dict) and result.get("clone_errors"):
-                clone_state["count"] += 1
-                if not clone_state["reason"]:
-                    clone_state["reason"] = str(result["clone_errors"][0])
             if status == "success":
                 downloaded += 1
                 if isinstance(result, dict) and result.get("sent_msg_id") and not pin_decision.get("first_msg_id"):
                     pin_decision["first_msg_id"] = result["sent_msg_id"]
                     pin_decision["first_msg"] = result.get("sent_msg")
+                    pin_decision["first_sender"] = result.get("sent_by") or "bot"
             else:
                 failed += 1
-
-        if clone_state["count"] and not clone_state["notified"]:
-            clone_state["notified"] = True
-            await reply_temporary(message,
-                f"ℹ️ **Cloning was not possible for {clone_state['count']} item(s)** — "
-                "those were downloaded and re-uploaded instead.\n"
-                f"**Reason:** `{clone_state['reason']}`")
 
         if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
                 and not pin_decision.get("pin_failed"):
@@ -975,7 +1027,8 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
                 bot, message, url, 
                 silent=False, 
                 pre_fetched_msg=chat_msg, 
-                abort_event=abort_event # Pass the global abort flag
+                abort_event=abort_event, # Pass the global abort flag
+                clone_notice=clone_notice
             ))
             batch_tasks.append(task)
 
@@ -991,9 +1044,18 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         await consume_results(results)
 
-    await loading.delete()
+    ACTIVE_BATCHES.pop(message.from_user.id, None)
+    try:
+        await loading.delete()
+    except Exception:
+        pass
 
-    completion_text = "**✅ Batch Process Complete!**" if not abort_event.is_set() else "**🛑 Batch Process Stopped (FloodWait)**"
+    if batch_state["cancelled"]:
+        completion_text = "**🛑 Batch Process Cancelled (/killall)**"
+    elif abort_event.is_set():
+        completion_text = "**🛑 Batch Process Stopped (FloodWait)**"
+    else:
+        completion_text = "**✅ Batch Process Complete!**"
 
     # A "Yes" that arrived late (after the auto-continue) is still honoured here.
     if pin_decision.get("pin_first") and not pin_decision.get("pinned") \
@@ -1016,6 +1078,7 @@ async def execute_batch_logic(bot: Client, message: Message, start_link: str, co
         f"📥 **Processed** : `{downloaded}`\n"
         f"⏭️ **Skipped** : `{skipped}`\n"
         f"❌ **Failed** : `{failed}`"
+        + (f"\n🛑 **Cancelled** : `{cancelled}`" if cancelled else "")
     )
 
 @bot.on_message(filters.command("stats") & filters.private)
@@ -1084,6 +1147,11 @@ async def cancel_all_tasks(_, message):
 
     # Release a pending pin prompt, otherwise the batch waiting on it hangs forever.
     await release_pending_prompt(user_id, "🛑 Pin prompt cancelled (/killall).")
+
+    # Stop running batch loops too, otherwise they keep scheduling new posts.
+    for state in list(ACTIVE_BATCHES.values()):
+        state["cancelled"] = True
+        state["abort"].set()
 
     for task in list(RUNNING_TASKS):
         if not task.done():

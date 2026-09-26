@@ -57,20 +57,39 @@ class PinRefused(Exception):
     """Stands in for Telegram's 400 MESSAGE_ID_INVALID."""
 
 
+PRIVATE_ID_OFFSET = 50000     # the other side of a private chat sees another id
+PIN_LOG = []                  # (role, chat_id, message_id, box, both_sides)
+PROTECTED_SOURCE = [False]    # source channel has content protection
+
+
 def logical_chat(role, chat_id):
+    """Message box a client addresses.
+
+    In a PRIVATE chat every account has its own message ids, so the user<->bot
+    chat is two boxes: botchat:user and botchat:bot.  Channels share one box.
+    """
     if isinstance(chat_id, str):
-        return "botchat" if chat_id == BOT_USERNAME else "str:%s" % chat_id
+        if chat_id == BOT_USERNAME:
+            return "botchat:user" if role == "user" else "str:%s" % chat_id
+        return "str:%s" % chat_id
     if chat_id == USER_ID:
-        return "botchat" if role == "bot" else "saved"
+        return "botchat:bot" if role == "bot" else "saved"
     if chat_id == BOT_ID:
-        return "botchat"
+        return "botchat:user" if role == "user" else "self:bot"
     return "chat:%s" % chat_id
 
 
 def register(role, chat_id, msg_id):
     key = logical_chat(role, chat_id)
     CHAT_MESSAGES.setdefault(key, {})[msg_id] = True
+    other = {"botchat:user": "botchat:bot", "botchat:bot": "botchat:user"}.get(key)
+    if other:   # the same message exists on the other side under ANOTHER id
+        CHAT_MESSAGES.setdefault(other, {})[msg_id + PRIVATE_ID_OFFSET] = True
     return key
+
+
+def is_destination_box(key):
+    return key == "saved" or key.startswith("botchat") or key.startswith("chat:")
 
 
 class FakeUser(object):
@@ -169,6 +188,7 @@ class FakeChatMessage(object):
             self.media = "video"      # truthy -> treated as downloadable
             self.photo = None
         self.media_group_id = GROUP_MEMBERS.get(mid)
+        self.has_protected_content = PROTECTED_SOURCE[0]
         self.text = None
         self.caption = None
         self.caption_entities = None
@@ -214,6 +234,7 @@ class FakeClient(object):
         self.pins = []
         self.unpins = []
         self.pin_error = None
+        self.forwarded = []
         self.copied = []
         self.created = []
         self.gate = None
@@ -250,7 +271,8 @@ class FakeClient(object):
             raise self.fetch_error
         single = not isinstance(message_ids, (list, tuple))
         ids = [message_ids] if single else list(message_ids)
-        known = CHAT_MESSAGES.get(logical_chat("bot", chat_id), {}) if self.role == "bot" else None
+        key = logical_chat(self.role, chat_id)
+        known = CHAT_MESSAGES.get(key, {}) if is_destination_box(key) else None
         out = []
         for mid in ids:
             if known is not None and mid not in known:
@@ -259,9 +281,30 @@ class FakeClient(object):
                 out.append(FakeChatMessage(mid))
         return out[0] if single else out
 
+    async def get_media_group(self, chat_id, message_id):
+        group = GROUP_MEMBERS.get(message_id)
+        if not group:
+            return [FakeChatMessage(message_id)]
+        return [FakeChatMessage(m) for m in sorted(GROUP_MEMBERS) if GROUP_MEMBERS[m] == group]
+
+    async def forward_messages(self, chat_id, from_chat_id, message_ids, drop_author=None, **kwargs):
+        if self.copy_error is not None:
+            raise self.copy_error            # protected content refuses forwards too
+        if self.role == "bot" and isinstance(from_chat_id, str):
+            raise Exception("CHANNEL_PRIVATE: the bot is not a member of the source")
+        if self.gate is not None:
+            await self.gate.wait()
+        ids = list(message_ids) if isinstance(message_ids, (list, tuple)) else [message_ids]
+        self.forwarded.append((chat_id, from_chat_id, ids, drop_author))
+        self.copied.append((chat_id, from_chat_id, ids[0]))
+        sent = [self._deliver(chat_id, source_id=m) for m in ids]
+        return sent if isinstance(message_ids, (list, tuple)) else sent[0]
+
     async def copy_message(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.copy_error is not None:
             raise self.copy_error
+        if self.role == "bot" and isinstance(from_chat_id, str):
+            raise Exception("CHANNEL_PRIVATE: the bot is not a member of the source")
         if self.gate is not None:
             await self.gate.wait()
         self.copied.append((chat_id, from_chat_id, message_id))
@@ -270,6 +313,8 @@ class FakeClient(object):
     async def copy_media_group(self, chat_id, from_chat_id, message_id, **kwargs):
         if self.copy_error is not None:
             raise self.copy_error
+        if self.role == "bot" and isinstance(from_chat_id, str):
+            raise Exception("CHANNEL_PRIVATE: the bot is not a member of the source")
         if self.gate is not None:
             await self.gate.wait()
         self.copied.append((chat_id, from_chat_id, message_id))
@@ -293,17 +338,19 @@ class FakeClient(object):
     async def send_media_group(self, chat_id, media, **kwargs):
         return [self._deliver(chat_id) for _ in media]
 
-    async def pin_chat_message(self, chat_id, message_id, disable_notification=False, **kwargs):
+    async def pin_chat_message(self, chat_id, message_id, disable_notification=False,
+                               both_sides=False, **kwargs):
         if self.pin_error:
             raise self.pin_error
-        key = logical_chat("bot", chat_id)
+        key = logical_chat(self.role, chat_id)
         if message_id not in CHAT_MESSAGES.get(key, {}):
             raise PinRefused(
                 "[400 MESSAGE_ID_INVALID] message %s does not exist in this chat (%s)"
                 % (message_id, key)
             )
         self.pins.append((chat_id, message_id))
-        return OutgoingMessage("pinned")
+        PIN_LOG.append((self.role, chat_id, message_id, key, both_sides))
+        return OutgoingMessage("pinned", register_it=False)
 
     async def unpin_chat_message(self, chat_id, message_id=None, **kwargs):
         self.unpins.append((chat_id, message_id))
@@ -328,6 +375,11 @@ def outgoing_texts():
     return texts
 
 
+def pins():
+    """Every successful pin, whichever client made it."""
+    return [(chat, mid) for _role, chat, mid, _box, _both in PIN_LOG]
+
+
 def bot_said(*needles):
     haystack = " \n ".join(outgoing_texts()).lower()
     return all(n.lower() in haystack for n in needles)
@@ -350,14 +402,21 @@ def reset(bot, user_client):
     main.DESTINATION_CHAT_ID = None
     del OUTGOING[:]
     CHAT_MESSAGES.clear()
+    del PIN_LOG[:]
+    PROTECTED_SOURCE[0] = False
     GROUP_MEMBERS.clear()
     del CHAT_MESSAGE_DOWNLOADS[:]
     MESSAGE_IS_PHOTO[0] = False
     bot.pins = []
     bot.unpins = []
     bot.pin_error = None
+    user_client.pin_error = None
+    user_client.pins = []
+    user_client.unpins = []
     bot.copy_error = None
     user_client.copy_error = None
+    bot.forwarded = []
+    user_client.forwarded = []
     bot.copied = []
     user_client.copied = []
     user_client.created = []
@@ -401,7 +460,7 @@ async def test_prompt_appears_and_blocks_batch():
 
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins == [], "pinned although the user said no"
+        assert pins() == [], "pinned although the user said no"
     finally:
         await drain_tasks()
 
@@ -414,7 +473,7 @@ async def test_yes_pins_first_post_once():
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins == [(USER_ID, 9100)], bot.pins
+        assert pins() == [("test_bot", 9100)], pins()
         assert user_client.copied, "nothing was uploaded"
     finally:
         await drain_tasks()
@@ -429,7 +488,7 @@ async def test_pin_targets_destination_channel():
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins == [(CHANNEL_ID, 9100)], bot.pins
+        assert pins() == [(CHANNEL_ID, 9100)], pins()
     finally:
         await drain_tasks()
 
@@ -449,7 +508,7 @@ async def test_timeout_starts_batch_without_pinning():
     try:
         runner = await start_prompt(bot, user_client)
         await asyncio.wait_for(runner, timeout=8)
-        assert bot.pins == [], "pinned even though nobody answered"
+        assert pins() == [], "pinned even though nobody answered"
         assert user_client.copied, "batch did not run after the timeout"
         assert bot_said("without pinning"), outgoing_texts()
     finally:
@@ -466,7 +525,7 @@ async def test_typing_yes_is_accepted():
     try:
         await main.handle_text_and_states(bot, IncomingMessage("yes"))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins == [(USER_ID, 9100)], bot.pins
+        assert pins() == [("test_bot", 9100)], pins()
     finally:
         await drain_tasks()
 
@@ -491,7 +550,7 @@ async def test_late_yes_still_pins():
         gate.set()
         user_client.gate = None
         await asyncio.wait_for(runner, timeout=8)
-        assert bot.pins == [(USER_ID, 9100)], (
+        assert pins() == [("test_bot", 9100)], (
             "late Yes was ignored - pin prompt answered after the timeout"
         )
     finally:
@@ -531,6 +590,7 @@ async def test_pin_failure_is_reported_to_user():
     bot, user_client = main.bot, main.user
     reset(bot, user_client)
     bot.pin_error = Exception("CHAT_ADMIN_REQUIRED")
+    user_client.pin_error = Exception("CHAT_ADMIN_REQUIRED")
     runner = await start_prompt(bot, user_client)
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
@@ -553,7 +613,7 @@ async def test_prompt_closed_after_batch():
         query = CallbackQuery("pin_decision:yes:%d" % USER_ID)
         await main.pin_decision_callback(bot, query)
         assert query.answers and query.answers[0][0], "stale click answered with nothing"
-        assert len(bot.pins) == 0
+        assert len(pins()) == 0
     finally:
         await drain_tasks()
 
@@ -584,11 +644,11 @@ async def test_pin_targets_bot_chat_message():
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins == [(USER_ID, 9100)], bot.pins
+        assert pins() == [("test_bot", 9100)], pins()
         assert user_client.created, "nothing was delivered"
-        assert bot.pins[0][1] == user_client.created[0], (
+        assert pins()[0][1] == user_client.created[0], (
             "pinned id %s is not the id the bot chat received (%s)"
-            % (bot.pins[0][1], user_client.created[0])
+            % (pins()[0][1], user_client.created[0])
         )
     finally:
         await drain_tasks()
@@ -639,13 +699,14 @@ async def test_pin_failure_reported_only_once():
     bot, user_client = main.bot, main.user
     reset(bot, user_client)
     bot.pin_error = Exception("MESSAGE_ID_INVALID")
+    user_client.pin_error = Exception("MESSAGE_ID_INVALID")
     runner = await start_prompt(bot, user_client, count=4, start_id=100)
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
         warnings = [m for m in OUTGOING if "could not pin" in (m.text or "").lower()]
         assert len(warnings) == 1, "pin failure reported %d time(s)" % len(warnings)
-        assert bot.pins == [], "a failed pin must not look like success"
+        assert pins() == [], "a failed pin must not look like success"
     finally:
         await drain_tasks()
 
@@ -668,7 +729,7 @@ async def test_stale_self_destination_never_pins_into_the_void():
         assert "saved" not in CHAT_MESSAGES, (
             "a copy was delivered to Saved Messages: %s" % list(CHAT_MESSAGES)
         )
-        assert bot.pins, "the first post was not pinned"
+        assert pins(), "the first post was not pinned"
         assert not bot_said("could not pin"), outgoing_texts()
         assert not bot_said("MESSAGE_ID_INVALID"), outgoing_texts()
     finally:
@@ -684,9 +745,8 @@ async def test_pinned_id_exists_in_pin_chat():
     try:
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=5)
-        assert bot.pins, "nothing was pinned"
-        pin_chat, pin_id = bot.pins[0]
-        key = logical_chat("bot", pin_chat)
+        assert PIN_LOG, "nothing was pinned"
+        _role, pin_chat, pin_id, key, _both = PIN_LOG[0]
         assert pin_id in CHAT_MESSAGES.get(key, {}), (
             "pinned %s but that id is not in %s (has %s)"
             % (pin_id, key, sorted(CHAT_MESSAGES.get(key, {})))
@@ -708,7 +768,7 @@ async def test_clone_is_preferred_over_download():
         assert CHAT_MESSAGE_DOWNLOADS == [], (
             "downloaded instead of cloning: %s" % CHAT_MESSAGE_DOWNLOADS
         )
-        assert not bot_said("cloning was not possible"), outgoing_texts()
+        assert not bot_said("could not clone"), outgoing_texts()
     finally:
         await drain_tasks()
 
@@ -727,7 +787,7 @@ async def test_download_fallback_only_when_clone_blocked():
         await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
         await asyncio.wait_for(runner, timeout=15)
         assert CHAT_MESSAGE_DOWNLOADS, "nothing was downloaded although copying was refused"
-        assert bot_said("cloning was not possible"), outgoing_texts()
+        assert bot_said("could not clone"), outgoing_texts()
         assert bot_said("CHAT_FORWARDS_RESTRICTED"), outgoing_texts()
     finally:
         await drain_tasks()
@@ -748,6 +808,105 @@ async def test_album_members_are_processed_once():
         )
         assert bot_said("**skipped** : `1`"), outgoing_texts()
     finally:
+        await drain_tasks()
+
+
+async def test_album_is_forwarded_whole_without_download():
+    """The live case: a 5-video album from a public channel is forwarded in ONE call."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    for mid in range(111, 116):
+        GROUP_MEMBERS[mid] = "ALBUM-111"
+    runner = await start_prompt(bot, user_client, count=5, start_id=111)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert CHAT_MESSAGE_DOWNLOADS == [], "album was downloaded: %s" % CHAT_MESSAGE_DOWNLOADS
+        assert len(user_client.forwarded) == 1, user_client.forwarded
+        _dest, _src, ids, drop_author = user_client.forwarded[0]
+        assert ids == [111, 112, 113, 114, 115], ids
+        assert drop_author is True, "forward must hide the original author (a clone)"
+        assert bot_said("**skipped** : `4`"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_pin_in_bot_chat_uses_the_senders_message_box():
+    """In a private chat ids are per account: pin with the client that made the copy."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:yes:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=5)
+        assert not bot_said("could not pin"), outgoing_texts()
+        assert PIN_LOG, "nothing was pinned"
+        role, _chat, _mid, box, both_sides = PIN_LOG[0]
+        assert box == "botchat:user" and role == "user", PIN_LOG
+        assert both_sides, "the pin must be visible to both sides of the chat"
+    finally:
+        await drain_tasks()
+
+
+async def test_protected_source_skips_pointless_clone_attempts():
+    """With content protection a clone cannot work: download at once and say why."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    MESSAGE_IS_PHOTO[0] = True
+    PROTECTED_SOURCE[0] = True
+    runner = await start_prompt(bot, user_client)
+    try:
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        await asyncio.wait_for(runner, timeout=15)
+        assert user_client.forwarded == [] and user_client.copied == [], "tried to clone protected content"
+        assert CHAT_MESSAGE_DOWNLOADS, "protected content was not downloaded"
+        assert bot_said("content protection"), outgoing_texts()
+    finally:
+        await drain_tasks()
+
+
+async def test_killall_stops_the_batch_instead_of_failing_it():
+    """/killall must stop the loop; cancelled items are not reported as failures."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    gate = asyncio.Event()
+    runner = await start_prompt(bot, user_client, count=40, start_id=100)
+    try:
+        user_client.gate = gate
+        await main.pin_decision_callback(bot, CallbackQuery("pin_decision:no:%d" % USER_ID))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if bot_said("starting batch process"):
+                break
+        await asyncio.sleep(0.05)
+        await main.cancel_all_tasks(bot, IncomingMessage("/killall"))
+        gate.set()
+        user_client.gate = None
+        await asyncio.wait_for(runner, timeout=5)
+        assert bot_said("cancelled"), outgoing_texts()
+        assert bot_said("**failed** : `0`"), outgoing_texts()
+        assert len(user_client.forwarded) < 40, "the batch kept going after /killall"
+    finally:
+        gate.set()
+        user_client.gate = None
+        await drain_tasks()
+
+
+async def test_error_cleanup_survives_killall():
+    """/killall must not cancel the timers that delete error messages."""
+    bot, user_client = main.bot, main.user
+    reset(bot, user_client)
+    original = main.PyroConf.ERROR_MESSAGE_TTL
+    main.PyroConf.ERROR_MESSAGE_TTL = 0.3
+    try:
+        await main.batch_command_start(bot, IncomingMessage("/batch"))
+        await main.handle_text_and_states(bot, IncomingMessage("not-a-link"))
+        err = OUTGOING[-1]
+        await main.cancel_all_tasks(bot, IncomingMessage("/killall"))
+        await asyncio.sleep(0.7)
+        assert err.deleted, "the error message stayed after /killall"
+    finally:
+        main.PyroConf.ERROR_MESSAGE_TTL = original
         await drain_tasks()
 
 
@@ -773,6 +932,11 @@ TESTS = [
     test_clone_is_preferred_over_download,
     test_download_fallback_only_when_clone_blocked,
     test_album_members_are_processed_once,
+    test_album_is_forwarded_whole_without_download,
+    test_pin_in_bot_chat_uses_the_senders_message_box,
+    test_protected_source_skips_pointless_clone_attempts,
+    test_killall_stops_the_batch_instead_of_failing_it,
+    test_error_cleanup_survives_killall,
 ]
 
 
